@@ -7,9 +7,9 @@ from ufs2arco.mpi import MPITopology, SerialTopology
 
 logger = logging.getLogger("eagle.tools")
 
-def setup(config_filename: str):
+def setup(config_filename: str, command: str):
     config = open_yaml_config(config_filename)
-    topo, use_mpi = init_topo(config)
+    topo, use_mpi = init_topo(config, command)
     config["topo"] = topo
     config["use_mpi"] = use_mpi
 
@@ -35,11 +35,11 @@ def open_yaml_config(config_filename: str):
                 logger.warning(f"Not expanding environment variables in {key} in config, since it could be many different types")
     return config
 
-def init_topo(config: dict) -> MPITopology | SerialTopology:
+def init_topo(config: dict, command: str) -> MPITopology | SerialTopology:
 
     use_mpi = are_we_using_mpi(config)
     if use_mpi:
-        topo = MPITopology(log_dir=config.get("log_path", "eagle-logs/metrics"))
+        topo = MPITopology(log_dir=config.get("log_path", f"eagle-logs/{command}"))
         logger.setLevel(logging.INFO)
         logger.addHandler(topo.log_handler)
 
