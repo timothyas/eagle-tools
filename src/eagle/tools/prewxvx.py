@@ -19,8 +19,6 @@ logger = logging.getLogger("eagle.tools")
 def main(config):
 
     topo = config["topo"]
-    if config["use_mpi"]:
-        raise NotImplementedError
 
     forecast_path = config["forecast_path"]
     output_path = config["output_path"]
@@ -48,7 +46,20 @@ def main(config):
         )
 
     dates = pd.date_range(config["start_date"], config["end_date"], freq=config["freq"])
-    for t0 in dates:
+    n_dates = len(dates)
+    n_batches = int(np.ceil(n_dates / topo.size))
+    for batch_idx in range(n_batches):
+
+        date_idx = (batch_idx * topo.size) + topo.rank
+        if date_idx + 1 > n_dates:
+            break # Last batch situation
+
+        try:
+            t0 = dates[date_idx]
+        except:
+            logger.error(f"Error getting this date: {date_idx} / {n_dates}")
+            raise
+
         st0 = t0.strftime("%Y-%m-%dT%H")
         logger.info(f"Processing {st0}")
 
