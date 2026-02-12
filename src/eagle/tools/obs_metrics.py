@@ -151,11 +151,11 @@ def align_obs_to_forecast_times(obs_df, forecast_valid_times, window):
         obs_times = obs_times.dt.tz_localize(None)
 
     for vt in forecast_valid_times:
-        vt_ts = pd.Timestamp(vt)
-        mask = (obs_times >= vt_ts - window) & (obs_times < vt_ts + window)
+        vtimestamp = pd.Timestamp(vt)
+        mask = (obs_times >= vtimestamp - window) & (obs_times < vtimestamp + window)
         matched = obs_df.loc[mask]
         if len(matched) > 0:
-            aligned[vt_ts] = matched
+            aligned[vtimestamp] = matched
     return aligned
 
 
@@ -256,19 +256,34 @@ def main(config):
     logger.info(f"Variables to verify: {forecast_var_names}")
 
     # Config options
-    model_type = config.get("model_type", "global")
+    model_type = config.get("model_type")
     lam_index = config.get("lam_index", None)
     lead_time = config["lead_time"]
     obs_dataset = config.get("obs_dataset", "conv-adpupa-NC002001")
     temporal_window = pd.Timedelta(config.get("temporal_window", "3h"))
     max_qc_value = config.get("max_qc_value", 2)
 
+    # does the user want to evaluate on a different grid?
+    # this doesn't include regridding the nested -> global resolution
+    target_regrid_kwargs = config.get("target_regrid_kwargs", None)
+    forecast_regrid_kwargs = config.get("forecast_regrid_kwargs", None)
+    do_any_regridding = (target_regrid_kwargs is not None) or \
+            ((forecast_regrid_kwargs is not None) and (model_type != "nested-global"))
+    if do_any_regridding:
+        raise NotImplementedError
+
+    if model_type == "nested-global":
+        forecast_regrid_kwargs["target_grid_path"] = prepare_regrid_target_mask(
+            anemoi_reference_dataset_kwargs=config["anemoi_reference_dataset_kwargs"],
+            horizontal_regrid_kwargs=forecast_regrid_kwargs,
+        )
+
     # Generate initialization dates
     dates = pd.date_range(config["start_date"], config["end_date"], freq=config["freq"])
     n_dates = len(dates)
     n_batches = int(np.ceil(n_dates / topo.size))
 
-    results_container = []
+    container = {"rmse": {}, "mae": {}, "bias": {}, "count": {}}
 
     logger.info(f"Observation Verification")
     logger.info(f"Dataset: {obs_dataset}")
@@ -298,9 +313,12 @@ def main(config):
                 fname,
                 model_type=model_type,
                 lam_index=lam_index,
+                trim_edge=config.get("trim_forecast_edge", None),
                 vars_of_interest=base_var_names,
                 levels=levels,
                 load=True,
+                lcc_info=config.get("lcc_info", None),
+                horizontal_regrid_kwargs=forecast_regrid_kwargs if model_type == "nested-global" else None,
             )
         else:
             fds = open_forecast_zarr_dataset(
@@ -309,10 +327,13 @@ def main(config):
                 vars_of_interest=base_var_names,
                 levels=levels,
                 load=True,
+                lcc_info=config.get("lcc_info", None),
             )
 
         # Get forecast valid times
+        logger.info(f"Opened fds\n{fds}")
         forecast_valid_times = fds["time"].values
+        logger.info(f"vtimes: {forecast_valid_times}")
 
         # Load observations for the full valid time range (padded by window)
         time_start = pd.Timestamp(forecast_valid_times[0]) - temporal_window
@@ -332,80 +353,82 @@ def main(config):
         # Compute metrics per forecast valid time
         fhr_list = []
         lead_times = []
-        metrics_data = {f"{fv}_{m}": [] for fv in forecast_var_names for m in ("rmse", "mae", "bias", "count")}
+        container_per_ic = {metric: {varname: [] for varname in forecast_var_names} for metric in container.keys()}
 
-        for ti, vt in enumerate(forecast_valid_times):
-            vt_ts = pd.Timestamp(vt)
-            fhr = int((vt_ts - t0).total_seconds() / 3600)
+        for t, vtime in enumerate(forecast_valid_times):
+            vtimestamp = pd.Timestamp(vtime)
+            fhr = int((vtimestamp - t0).total_seconds() / 3600)
             fhr_list.append(fhr)
-            lead_times.append(vt_ts - t0)
+            lead_times.append(vtimestamp - t0)
 
-            if vt_ts not in aligned:
-                for fv in forecast_var_names:
-                    for m in ("rmse", "mae", "bias"):
-                        metrics_data[f"{fv}_{m}"].append(np.nan)
-                    metrics_data[f"{fv}_count"].append(0)
+            if vtimestamp not in aligned:
+                for varname in forecast_var_names:
+                    for metric in container.keys():
+                        fillvalue = 0 if metric == "count" else np.nan
+                        container_per_ic[metric][varname].append(fillvalue)
                 continue
 
-            matched_obs = aligned[vt_ts]
+            matched_obs = aligned[vtimestamp]
             obs_lats = matched_obs["LAT"].values
             obs_lons = matched_obs["LON"].values
 
             # Select this time step from forecast
-            fds_t = fds.sel(time=vt)
+            fds_t = fds.sel(time=vtime)
 
-            for fv, vinfo in variable_map.items():
+            for varname, vinfo in variable_map.items():
                 # Select the correct level and interpolate forecast to obs locations
                 fds_tv = fds_t.sel(level=vinfo["level"])
-                forecast_vals = interpolate_forecast_to_obs(fds_tv, obs_lats, obs_lons, vinfo["base_name"])
+                forecast_vals = interpolate_forecast_to_obs(
+                    fds.sel(time=vtime, level=vinfo["level"]),
+                    obs_lats,
+                    obs_lons,
+                    vinfo["base_name"],
+                )
                 obs_vals = matched_obs[vinfo["obs_col"]].values
 
                 result = compute_obs_metrics(forecast_vals, obs_vals)
-                for m in ("rmse", "mae", "bias"):
-                    metrics_data[f"{fv}_{m}"].append(result[m])
-                metrics_data[f"{fv}_count"].append(result["count"])
+                for metric in container.keys():
+                    container_per_ic[metric][varname].append(result[metric])
 
         # Assemble into xr.Dataset
         fhr_arr = np.array(fhr_list, dtype=int)
-        data_vars = {}
-        for key, vals in metrics_data.items():
-            if key.endswith("_count"):
-                data_vars[key] = xr.DataArray(
-                    np.array(vals, dtype=int),
+        for metric, thedata in container_per_ic.items():
+            data_vars = {}
+            for varname, vals in thedata.items():
+                data_vars[varname] = xr.DataArray(
+                    np.array(vals, dtype=int if metric == "count" else float),
                     dims=("fhr",),
                 )
-            else:
-                data_vars[key] = xr.DataArray(
-                    np.array(vals, dtype=float),
-                    dims=("fhr",),
-                )
+            this_metric_ds = xr.Dataset(
+                data_vars,
+                coords={
+                    "fhr": fhr_arr,
+                    "lead_time": ("fhr", np.array(lead_times, dtype="timedelta64[ns]")),
+                    "t0": t0,
+                },
+            )
+            this_metric_ds.set_coords(["lead_time", "t0"])
+            this_metric_ds["lead_time"].attrs = {}
+            container[metric].append(this_metric_ds)
 
-        result_ds = xr.Dataset(
-            data_vars,
-            coords={
-                "fhr": fhr_arr,
-                "lead_time": ("fhr", np.array(lead_times, dtype="timedelta64[ns]")),
-                "t0": t0,
-            },
-        )
-        result_ds = result_ds.set_coords(["lead_time", "t0"])
-        result_ds["lead_time"].attrs = {}
-
-        results_container.append(result_ds)
         logger.info(f"Done with {st0}")
 
     logger.info("Done Computing Observation Verification Metrics")
 
     logger.info("Gathering Results on Root Process")
-    results_container = topo.gather(results_container)
+    for name in container.keys():
+        container[name] = topo.gather(container[name])
 
     if topo.is_root:
-        if config["use_mpi"]:
-            results_container = [xds for sublist in results_container for xds in sublist]
-        results_container = sorted(results_container, key=lambda xds: xds.coords["t0"])
-        combined = xr.concat(results_container, dim="t0")
+        for name in container:
+            c = container[name]
+            if config["use_mpi"]:
+                c = [xds for sublist in c for xds in sublist]
+            c = sorted(c, key=lambda xds: xds.coords["t0"])
+            container[name] = xr.concat(c, dim="t0")
 
-        fname = f"{config['output_path']}/obs_verify.{obs_dataset}.nc"
-        combined.to_netcdf(fname)
-        logger.info(f"Stored result: {fname}")
+        for metric, xds in container.items():
+            fname = f"{config['output_path']}/obs.{metric}.{obs_dataset}.nc"
+            xds.to_netcdf(fname)
+            logger.info(f"Stored result: {fname}")
         logger.info("Done Storing Observation Verification Metrics")
