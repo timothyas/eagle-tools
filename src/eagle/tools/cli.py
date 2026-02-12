@@ -418,6 +418,70 @@ def postwxvx(config_file):
     config = setup(config_file, "postwxvx")
     main(config)
 
+@cli.command("obs-metrics")
+@click.argument('config_file', type=click.Path(exists=True))
+def obs_metrics(config_file):
+    """Verify forecasts against observations."""
+    from eagle.tools.obs_metrics import main
+    config = setup(config_file, "obs_metrics")
+    main(config)
+
+obs_metrics.help = """Verify forecasts against real observations (e.g., radiosondes).
+
+    \b
+    This workflow loads forecast data and compares it against irregular
+    observation data (station-based, not gridded). Forecasts are interpolated
+    to observation locations, and RMSE, MAE, bias, and count are computed
+    per forecast hour.
+
+    \b
+    Note:
+        Observations are loaded from nnja_ai.DataCatalog (parquet from GCS).
+        Quality control filtering is applied per-variable using NCEP PREPBUFR codes.
+
+    \b
+    Note:
+        The arguments documented here are passed via a config dictionary.
+
+    \b
+    Config Args:
+        forecast_path (str): The directory path containing the forecast datasets.
+        \b
+        lead_time (int): Length of forecast in hours.
+        \b
+        output_path (str): The directory where the output NetCDF file will be saved, as
+            f"{output_path}/obs_metrics.{obs_dataset}.nc"
+        \b
+        start_date (str): The first initial condition date to process.
+        \b
+        end_date (str): The last initial condition date to process.
+        \b
+        freq (str): Frequency string for the date range (e.g., "12h").
+        \b
+        model_type (str, optional): The type of model grid. Defaults to "global".
+        \b
+        obs_dataset (str, optional): Name of the observation dataset in nnja_ai catalog.
+            Defaults to "conv-adpupa-NC002001" (radiosondes).
+        \b
+        temporal_window (str, optional): Time window (+/-) for matching obs to forecast
+            valid times. Defaults to "3h".
+        \b
+        max_qc_value (int, optional): Keep obs with QC flag <= this value. NaN QC flags
+            are always kept. Defaults to 2.
+        \b
+        variables (dict, optional): Variable pairings mapping forecast base names to
+            obs column names, QC column names, pressure levels, and unit conversions.
+            Defaults to temperature at 850 hPa and geopotential height at 500 hPa.
+        \b
+        from_anemoi (bool, optional): If True, opens forecast data using the anemoi
+            inference dataset format. Defaults to True.
+        \b
+        use_mpi (bool, optional): If True, distribute initialization dates across MPI ranks.
+        \b
+        log_path (str, optional): When using MPI, the directory for per-rank log files.
+    """
+
+
 @cli.command()
 @click.option('--offline_path', required=True, type=click.Path(exists=True), help='Path to the experiment mlflow logs')
 @click.option('--local_id', required=True, type=str, help='The generated 18 character experiment ID')
