@@ -1,13 +1,13 @@
 import logging
 
 import numpy as np
-from scipy.interpolate import RegularGridInterpolator
 import xarray as xr
 import pandas as pd
 
 import nnja_ai
 
 from eagle.tools.data import open_anemoi_inference_dataset, open_forecast_zarr_dataset
+from eagle.tools.metrics import postprocess
 
 logger = logging.getLogger("eagle.tools")
 
@@ -159,60 +159,6 @@ def align_obs_to_forecast_times(obs_df, forecast_valid_times, window):
     return aligned
 
 
-def interpolate_forecast_to_obs(forecast_ds, obs_lats, obs_lons, forecast_var):
-    """Interpolate forecast field to observation locations using bilinear interpolation.
-
-    The forecast has a flattened 'values' dim (64800 points = 180 lat x 360 lon)
-    on a regular 1-degree grid (lats: -89.5 to 89.5, lons: 0.5 to 359.5).
-
-    Obs longitudes should already be converted to 0-360 range.
-
-    Args:
-        forecast_ds: xr.Dataset with forecast_var as data variable,
-                     dims (time, values), latitude/longitude as data vars.
-        obs_lats: Array of observation latitudes.
-        obs_lons: Array of observation longitudes (0-360).
-        forecast_var: Name of forecast variable to interpolate.
-
-    Returns:
-        np.ndarray of interpolated forecast values at obs locations.
-    """
-    lat_vals = forecast_ds["latitude"].values
-    lon_vals = forecast_ds["longitude"].values
-    unique_lats = np.sort(np.unique(lat_vals))
-    unique_lons = np.sort(np.unique(lon_vals))
-    nlat = len(unique_lats)
-    nlon = len(unique_lons)
-
-    # Reshape flattened forecast to 2D (lat, lon)
-    field_flat = forecast_ds[forecast_var].values
-    field_2d = field_flat.reshape(nlat, nlon)
-
-    # Pad longitude for wrap-around interpolation at the 0/360 boundary
-    dlon = unique_lons[1] - unique_lons[0]
-    lons_padded = np.concatenate([
-        [unique_lons[0] - dlon],
-        unique_lons,
-        [unique_lons[-1] + dlon],
-    ])
-    field_padded = np.concatenate([
-        field_2d[:, -1:],
-        field_2d,
-        field_2d[:, :1],
-    ], axis=1)
-
-    interp = RegularGridInterpolator(
-        (unique_lats, lons_padded),
-        field_padded,
-        method="linear",
-        bounds_error=False,
-        fill_value=np.nan,
-    )
-
-    points = np.column_stack([obs_lats, obs_lons])
-    return interp(points)
-
-
 def compute_obs_metrics(forecast_values, obs_values):
     """Compute verification metrics between forecast and observation values.
 
@@ -226,17 +172,22 @@ def compute_obs_metrics(forecast_values, obs_values):
     valid = np.isfinite(forecast_values) & np.isfinite(obs_values)
     n = valid.sum()
     if n == 0:
-        return {"rmse": np.nan, "mae": np.nan, "bias": np.nan, "count": 0}
-
-    f = forecast_values[valid]
-    o = obs_values[valid]
-    diff = f - o
-    return {
-        "rmse": float(np.sqrt(np.mean(diff**2))),
-        "mae": float(np.mean(np.abs(diff))),
-        "bias": float(np.mean(diff)),
-        "count": int(n),
-    }
+        result = {"rmse": np.nan, "mae": np.nan, "bias": np.nan, "count": 0}
+    else:
+        f = forecast_values[valid]
+        o = obs_values[valid]
+        diff = f - o
+        result = {
+            "rmse": float(np.sqrt(np.mean(diff**2))),
+            "mae": float(np.mean(np.abs(diff))),
+            "bias": float(np.mean(diff)),
+            "count": int(n),
+        }
+    xds = xr.Dataset(result)
+    xds = xds.expand_dims({"time": [forecast_values["time"].values]})
+#    if "level" in forecast_values.coords:
+#        xds = xds.expand_dims({"level": [forecast_values["level"].values]})
+    return xds
 
 
 def main(config):
@@ -283,7 +234,7 @@ def main(config):
     n_dates = len(dates)
     n_batches = int(np.ceil(n_dates / topo.size))
 
-    container = {"rmse": {}, "mae": {}, "bias": {}, "count": {}}
+    container = {"rmse": [], "mae": [], "bias": [], "count": []}
 
     logger.info(f"Observation Verification")
     logger.info(f"Dataset: {obs_dataset}")
@@ -319,6 +270,7 @@ def main(config):
                 load=True,
                 lcc_info=config.get("lcc_info", None),
                 horizontal_regrid_kwargs=forecast_regrid_kwargs if model_type == "nested-global" else None,
+                reshape_cell_to_2d=True,
             )
         else:
             fds = open_forecast_zarr_dataset(
@@ -329,6 +281,17 @@ def main(config):
                 load=True,
                 lcc_info=config.get("lcc_info", None),
             )
+
+        # Pad in longitude
+        if "global" in model_type:
+            dlon = fds["longitude"].diff("longitude").values[0]
+            fds = fds.pad({"longitude": 1}, mode="wrap")
+            plon = np.concatenate([
+                [fds["longitude"][1].values - dlon],
+                fds["longitude"].values[1:-1],
+                [fds["longitude"][-2].values + dlon],
+            ])
+            fds["longitude"] = plon
 
         # Get forecast valid times
         logger.info(f"Opened fds\n{fds}")
@@ -351,64 +314,44 @@ def main(config):
         aligned = align_obs_to_forecast_times(obs_df, forecast_valid_times, temporal_window)
 
         # Compute metrics per forecast valid time
-        fhr_list = []
-        lead_times = []
         container_per_ic = {metric: {varname: [] for varname in forecast_var_names} for metric in container.keys()}
 
-        for t, vtime in enumerate(forecast_valid_times):
+        for vtime in forecast_valid_times:
             vtimestamp = pd.Timestamp(vtime)
-            fhr = int((vtimestamp - t0).total_seconds() / 3600)
-            fhr_list.append(fhr)
-            lead_times.append(vtimestamp - t0)
 
+            # Handle case where we don't have obs
             if vtimestamp not in aligned:
                 for varname in forecast_var_names:
                     for metric in container.keys():
                         fillvalue = 0 if metric == "count" else np.nan
-                        container_per_ic[metric][varname].append(fillvalue)
+                        fillds = xr.DataArray(fillvalue, coords={"time": [vtime]}, dims=("time",))
+                        container_per_ic[metric][varname].append(fillds)
                 continue
 
-            matched_obs = aligned[vtimestamp]
-            obs_lats = matched_obs["LAT"].values
-            obs_lons = matched_obs["LON"].values
+            # TODO: maybe do this conversion earlier?
+            matched_obs = aligned[vtimestamp].to_xarray()
 
-            # Select this time step from forecast
-            fds_t = fds.sel(time=vtime)
-
+            # Interp to obs locations and compute metrics
+            interpolated = fds.sel(time=vtime).interp({
+                "longitude": matched_obs["LON"],
+                "latitude": matched_obs["LAT"],
+            })
             for varname, vinfo in variable_map.items():
-                # Select the correct level and interpolate forecast to obs locations
-                fds_tv = fds_t.sel(level=vinfo["level"])
-                forecast_vals = interpolate_forecast_to_obs(
-                    fds.sel(time=vtime, level=vinfo["level"]),
-                    obs_lats,
-                    obs_lons,
-                    vinfo["base_name"],
-                )
-                obs_vals = matched_obs[vinfo["obs_col"]].values
+                fvals = interpolated[vinfo["base_name"]]
+                if "level" in fvals.dims:
+                    fvals = fvals.sel(level=vinfo["level"])
 
-                result = compute_obs_metrics(forecast_vals, obs_vals)
+                result = compute_obs_metrics(fvals, matched_obs[vinfo["obs_col"]])
                 for metric in container.keys():
                     container_per_ic[metric][varname].append(result[metric])
 
         # Assemble into xr.Dataset
-        fhr_arr = np.array(fhr_list, dtype=int)
         for metric, thedata in container_per_ic.items():
             data_vars = {}
             for varname, vals in thedata.items():
-                data_vars[varname] = xr.DataArray(
-                    np.array(vals, dtype=int if metric == "count" else float),
-                    dims=("fhr",),
-                )
-            this_metric_ds = xr.Dataset(
-                data_vars,
-                coords={
-                    "fhr": fhr_arr,
-                    "lead_time": ("fhr", np.array(lead_times, dtype="timedelta64[ns]")),
-                    "t0": t0,
-                },
-            )
-            this_metric_ds.set_coords(["lead_time", "t0"])
-            this_metric_ds["lead_time"].attrs = {}
+                data_vars[varname] = xr.concat(vals, dim="time")
+
+            this_metric_ds = postprocess(xr.Dataset(data_vars))
             container[metric].append(this_metric_ds)
 
         logger.info(f"Done with {st0}")
