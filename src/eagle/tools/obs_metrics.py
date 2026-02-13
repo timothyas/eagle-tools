@@ -26,11 +26,13 @@ DATASET_REGISTRY = {
     },
     "conv-adpsfc-NC000001": {
         "t2m": {"obs_var": "TMPSQ1.TMDB", "obs_qc_var": "TMPSQ1.QMAT"},
+        "sp": {"obs_var": "PRSSQ1.PRES", "obs_qc_var": "PRSSQ1.QMPR"},
         "u10": {"obs_wspd_var": "WNDSQ1.WSPD", "obs_wdir_var": "WNDSQ1.WDIR", "obs_qc_var": "WNDSQ1.QMWN"},
         "v10": {"obs_wspd_var": "WNDSQ1.WSPD", "obs_wdir_var": "WNDSQ1.WDIR", "obs_qc_var": "WNDSQ1.QMWN"},
     },
     "conv-adpsfc-NC000002": {
         "t2m": {"obs_var": "TMPSQ1.TMDB", "obs_qc_var": "TMPSQ1.QMAT"},
+        "sp": {"obs_var": "PRSSQ1.PRES", "obs_qc_var": "PRSSQ1.QMPR"},
         "u10": {"obs_wspd_var": "WNDSQ1.WSPD", "obs_wdir_var": "WNDSQ1.WDIR", "obs_qc_var": "WNDSQ1.QMWN"},
         "v10": {"obs_wspd_var": "WNDSQ1.WSPD", "obs_wdir_var": "WNDSQ1.WDIR", "obs_qc_var": "WNDSQ1.QMWN"},
     },
@@ -41,6 +43,7 @@ DATASET_REGISTRY = {
     },
     "conv-adpsfc-NC000101": {
         "t2m": {"obs_var": "TEMHUMDA.TMDB", "obs_qc_var": "QMAT"},
+        "sp": {"obs_var": "PRESDATA.PRESSQ03.PRES", "obs_qc_var": "QMPR"},
         "u10": {"obs_wspd_var": "BSYWND1.WSPD", "obs_wdir_var": "BSYWND1.WDIR", "obs_qc_var": "QMWN"},
         "v10": {"obs_wspd_var": "BSYWND1.WSPD", "obs_wdir_var": "BSYWND1.WDIR", "obs_qc_var": "QMWN"},
     },
@@ -53,7 +56,7 @@ WIND_VARIABLES = {
     "v10": {"group": "uv10", "component": "v"},
 }
 
-DEFAULT_VARIABLES = ["t", "gh", "t2m", "u", "v", "u10", "v10"]
+DEFAULT_VARIABLES = ["t", "gh", "t2m", "sp", "u", "v", "u10", "v10"]
 DEFAULT_LEVELS = [500, 850]
 
 
