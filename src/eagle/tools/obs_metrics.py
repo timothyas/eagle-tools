@@ -22,98 +22,183 @@ DATASET_REGISTRY = {
         "t": {"obs_var": "TMDB", "obs_qc_var": "QMAT"},
         "gh": {"obs_var": "GP10", "obs_qc_var": "QMGP", "unit_conversion": "gp_to_gph"},
     },
+    "conv-adpsfc-NC000001": {
+        "t2m": {"obs_var": "TMPSQ1.TMDB", "obs_qc_var": "TMPSQ1.QMAT"},
+    },
+    "conv-adpsfc-NC000002": {
+        "t2m": {"obs_var": "TMPSQ1.TMDB", "obs_qc_var": "TMPSQ1.QMAT"},
+    },
+    "conv-adpsfc-NC000007": {
+        "t2m": {"obs_var": "MTRTMP.TMDB", "obs_qc_var": "MTRTMP.QMAT"},
+    },
+    "conv-adpsfc-NC000101": {
+        "t2m": {"obs_var": "TEMHUMDA.TMDB", "obs_qc_var": "QMAT"},
+    },
 }
 
 DEFAULT_VARIABLES = {
     "t": {"levels": [850]},
     "gh": {"levels": [500]},
+    "t2m": {},
 }
 
 
-def build_variable_map(config, obs_dataset):
+def build_variable_map(config):
     """Expand config variables dict into a flat map keyed by forecast variable name.
 
-    Merges user config (levels) with dataset-specific info (obs_var, obs_qc_var,
-    unit_conversion) from DATASET_REGISTRY.
+    Uses standardized obs column names (obs_{var}, obs_qc_{var}) that are
+    independent of any specific dataset.  Surface variables (no levels) get
+    level=None.
 
     Returns:
         dict: e.g. {
             "t_850": {
-                "obs_col": "TMDB_PRLC85000",
-                "obs_qc_col": "QMAT_PRLC85000",
-                "unit_conversion": None,
+                "base_name": "t",
+                "level": 850,
+                "obs_col": "obs_t",
+                "obs_qc_col": "obs_qc_t",
+                "unit_conversion": "gp_to_gph" or None,
             },
-            "gh_500": {
-                "obs_col": "GP10_PRLC50000",
-                "obs_qc_col": "QMGP_PRLC50000",
-                "unit_conversion": "gp_to_gph",
+            "t2m": {
+                "base_name": "t2m",
+                "level": None,
+                "obs_col": "obs_t2m",
+                "obs_qc_col": "obs_qc_t2m",
+                "unit_conversion": None,
             },
         }
     """
-    if obs_dataset not in DATASET_REGISTRY:
-        raise ValueError(
-            f"Unknown obs_dataset '{obs_dataset}'. "
-            f"Available datasets: {list(DATASET_REGISTRY.keys())}"
-        )
-    registry = DATASET_REGISTRY[obs_dataset]
+    # Collect all variable names available across all datasets
+    all_registry_vars = set()
+    for reg in DATASET_REGISTRY.values():
+        all_registry_vars.update(reg.keys())
 
     variables = config.get("variables", DEFAULT_VARIABLES)
     variable_map = {}
     for base_name, vinfo in variables.items():
-        if base_name not in registry:
+        if base_name not in all_registry_vars:
             raise ValueError(
-                f"Variable '{base_name}' is not available for dataset '{obs_dataset}'. "
-                f"Available variables: {list(registry.keys())}"
+                f"Variable '{base_name}' is not available in any dataset. "
+                f"Available variables: {sorted(all_registry_vars)}"
             )
-        reg = registry[base_name]
-        obs_var = reg["obs_var"]
-        obs_qc_var = reg["obs_qc_var"]
-        conversion = reg.get("unit_conversion", None)
-        for level in vinfo["levels"]:
-            forecast_var = f"{base_name}_{level}"
-            prlc_suffix = f"PRLC{level * 100}"
-            variable_map[forecast_var] = {
+
+        # Look up unit_conversion from the first registry entry that has this variable
+        conversion = None
+        for reg in DATASET_REGISTRY.values():
+            if base_name in reg:
+                conversion = reg[base_name].get("unit_conversion", None)
+                break
+
+        levels = vinfo.get("levels", None)
+        if levels:
+            for level in levels:
+                forecast_var = f"{base_name}_{level}"
+                variable_map[forecast_var] = {
+                    "base_name": base_name,
+                    "level": level,
+                    "obs_col": f"obs_{base_name}",
+                    "obs_qc_col": f"obs_qc_{base_name}",
+                    "unit_conversion": conversion,
+                }
+        else:
+            # Surface variable — no levels
+            variable_map[base_name] = {
                 "base_name": base_name,
-                "level": level,
-                "obs_col": f"{obs_var}_{prlc_suffix}",
-                "obs_qc_col": f"{obs_qc_var}_{prlc_suffix}",
+                "level": None,
+                "obs_col": f"obs_{base_name}",
+                "obs_qc_col": f"obs_qc_{base_name}",
                 "unit_conversion": conversion,
             }
     return variable_map
 
 
-def load_observations(config, time_range, variable_map):
-    """Load observation data from nnja_ai DataCatalog.
+def load_all_observations(time_range, variable_map):
+    """Load observations from all datasets in DATASET_REGISTRY.
+
+    For each dataset, determines which user-requested variables it supports,
+    builds the real column names, loads from nnja_ai, renames to standardized
+    names, and concatenates all DataFrames.
 
     Args:
-        config: Config dict with obs_dataset key.
         time_range: (start, end) tuple of pd.Timestamps for time selection.
         variable_map: Output of build_variable_map.
 
     Returns:
-        pd.DataFrame with LAT, LON, OBS_TIMESTAMP, and obs/QC columns.
+        pd.DataFrame with LAT, LON, OBS_TIMESTAMP, and standardized
+        obs/QC columns (obs_{var}, obs_qc_{var}).
     """
-    obs_dataset = config.get("obs_dataset", "conv-adpupa-NC002001")
-
-    columns = ["LAT", "LON", "OBS_TIMESTAMP"]
-    for vinfo in variable_map.values():
-        columns.append(vinfo["obs_col"])
-        columns.append(vinfo["obs_qc_col"])
-    columns = list(dict.fromkeys(columns))  # deduplicate, preserve order
-
     dc = nnja_ai.DataCatalog()
-    ds = dc[obs_dataset]
-    try:
-        subds = ds.sel(
-            time=slice(str(time_range[0]), str(time_range[1])),
-            variables=columns,
-        )
-        obs_df = subds.load_dataset()
-    except nnja_ai.exceptions.EmptyTimeSubsetError:
-        logger.warning(f"No observations found for time range {time_range[0]} to {time_range[1]}")
-        obs_df = pd.DataFrame(columns=columns)
-    logger.info(f"Loaded {len(obs_df)} observations from {obs_dataset}")
-    return obs_df
+    all_frames = []
+
+    for dataset_name, registry in DATASET_REGISTRY.items():
+        # Determine which requested variables this dataset supports
+        supported = {}
+        for forecast_var, vinfo in variable_map.items():
+            base_name = vinfo["base_name"]
+            if base_name not in registry:
+                continue
+            reg = registry[base_name]
+            level = vinfo["level"]
+            if level is not None:
+                # Upper-air: construct PRLC-suffixed column names
+                prlc_suffix = f"PRLC{level * 100}"
+                real_obs_col = f"{reg['obs_var']}_{prlc_suffix}"
+                real_qc_col = f"{reg['obs_qc_var']}_{prlc_suffix}"
+            else:
+                # Surface: use dotted column names as-is
+                real_obs_col = reg["obs_var"]
+                real_qc_col = reg["obs_qc_var"]
+            supported[forecast_var] = {
+                "real_obs_col": real_obs_col,
+                "real_qc_col": real_qc_col,
+                "std_obs_col": vinfo["obs_col"],
+                "std_qc_col": vinfo["obs_qc_col"],
+            }
+
+        if not supported:
+            continue
+
+        # Build column list for this dataset
+        columns = ["LAT", "LON", "OBS_TIMESTAMP"]
+        for sinfo in supported.values():
+            columns.append(sinfo["real_obs_col"])
+            columns.append(sinfo["real_qc_col"])
+        columns = list(dict.fromkeys(columns))  # deduplicate, preserve order
+
+        ds = dc[dataset_name]
+        try:
+            subds = ds.sel(
+                time=slice(str(time_range[0]), str(time_range[1])),
+                variables=columns,
+            )
+            obs_df = subds.load_dataset()
+        except nnja_ai.exceptions.EmptyTimeSubsetError:
+            logger.warning(f"No observations in {dataset_name} for {time_range[0]} to {time_range[1]}")
+            continue
+
+        # Rename real column names to standardized names
+        rename_map = {}
+        for sinfo in supported.values():
+            rename_map[sinfo["real_obs_col"]] = sinfo["std_obs_col"]
+            rename_map[sinfo["real_qc_col"]] = sinfo["std_qc_col"]
+        obs_df = obs_df.rename(columns=rename_map)
+
+        logger.info(f"Loaded {len(obs_df)} observations from {dataset_name}")
+        all_frames.append(obs_df)
+
+    if all_frames:
+        result = pd.concat(all_frames, ignore_index=True)
+        logger.info(f"Total observations across all datasets: {len(result)}")
+    else:
+        # Build empty DataFrame with expected columns
+        std_columns = ["LAT", "LON", "OBS_TIMESTAMP"]
+        for vinfo in variable_map.values():
+            std_columns.append(vinfo["obs_col"])
+            std_columns.append(vinfo["obs_qc_col"])
+        std_columns = list(dict.fromkeys(std_columns))
+        result = pd.DataFrame(columns=std_columns)
+        logger.warning("No observations loaded from any dataset")
+    return result
 
 
 def apply_qc_filter(obs_df, variable_map, max_qc_value=2):
@@ -213,12 +298,11 @@ def main(config):
     topo = config["topo"]
 
     # Build variable map
-    obs_dataset = config.get("obs_dataset", "conv-adpupa-NC002001")
-    variable_map = build_variable_map(config, obs_dataset)
+    variable_map = build_variable_map(config)
     forecast_var_names = list(variable_map.keys())
     # Extract unique base variable names and levels for loading the forecast
     base_var_names = list({vinfo["base_name"] for vinfo in variable_map.values()})
-    levels = sorted({vinfo["level"] for vinfo in variable_map.values()})
+    levels = sorted({v["level"] for v in variable_map.values() if v["level"] is not None})
     logger.info(f"Variables to verify: {forecast_var_names}")
 
     # Config options
@@ -251,7 +335,7 @@ def main(config):
     container = {"rmse": [], "mae": [], "bias": [], "count": []}
 
     logger.info(f"Observation Verification")
-    logger.info(f"Dataset: {obs_dataset}")
+    logger.info(f"Datasets: {list(DATASET_REGISTRY.keys())}")
     logger.info(f"Temporal window: +/- {temporal_window}")
     logger.info(f"Max QC value: {max_qc_value}")
     logger.info(f"Initial Conditions:\n{dates}")
@@ -315,7 +399,7 @@ def main(config):
         # Load observations for the full valid time range (padded by window)
         time_start = pd.Timestamp(forecast_valid_times[0]) - temporal_window
         time_end = pd.Timestamp(forecast_valid_times[-1]) + temporal_window
-        obs_df = load_observations(config, (time_start, time_end), variable_map)
+        obs_df = load_all_observations((time_start, time_end), variable_map)
 
         # QC filter and unit conversion
         obs_df = apply_qc_filter(obs_df, variable_map, max_qc_value=max_qc_value)
@@ -385,7 +469,7 @@ def main(config):
             container[name] = xr.concat(c, dim="t0")
 
         for metric, xds in container.items():
-            fname = f"{config['output_path']}/obs.{metric}.{obs_dataset}.nc"
+            fname = f"{config['output_path']}/obs.conv.{metric}.nc"
             xds.to_netcdf(fname)
             logger.info(f"Stored result: {fname}")
         logger.info("Done Storing Observation Verification Metrics")
