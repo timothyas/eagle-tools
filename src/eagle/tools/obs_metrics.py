@@ -21,25 +21,46 @@ DATASET_REGISTRY = {
     "conv-adpupa-NC002001": {
         "t": {"obs_var": "TMDB", "obs_qc_var": "QMAT"},
         "gh": {"obs_var": "GP10", "obs_qc_var": "QMGP", "unit_conversion": "gp_to_gph"},
+        "u": {"obs_wspd_var": "WSPD", "obs_wdir_var": "WDIR", "obs_qc_var": "QMWN"},
+        "v": {"obs_wspd_var": "WSPD", "obs_wdir_var": "WDIR", "obs_qc_var": "QMWN"},
     },
     "conv-adpsfc-NC000001": {
         "t2m": {"obs_var": "TMPSQ1.TMDB", "obs_qc_var": "TMPSQ1.QMAT"},
+        "u10": {"obs_wspd_var": "WNDSQ1.WSPD", "obs_wdir_var": "WNDSQ1.WDIR", "obs_qc_var": "WNDSQ1.QMWN"},
+        "v10": {"obs_wspd_var": "WNDSQ1.WSPD", "obs_wdir_var": "WNDSQ1.WDIR", "obs_qc_var": "WNDSQ1.QMWN"},
     },
     "conv-adpsfc-NC000002": {
         "t2m": {"obs_var": "TMPSQ1.TMDB", "obs_qc_var": "TMPSQ1.QMAT"},
+        "u10": {"obs_wspd_var": "WNDSQ1.WSPD", "obs_wdir_var": "WNDSQ1.WDIR", "obs_qc_var": "WNDSQ1.QMWN"},
+        "v10": {"obs_wspd_var": "WNDSQ1.WSPD", "obs_wdir_var": "WNDSQ1.WDIR", "obs_qc_var": "WNDSQ1.QMWN"},
     },
     "conv-adpsfc-NC000007": {
         "t2m": {"obs_var": "MTRTMP.TMDB", "obs_qc_var": "MTRTMP.QMAT"},
+        "u10": {"obs_wspd_var": "MTRWND.WSPD", "obs_wdir_var": "MTRWND.WDIR", "obs_qc_var": "MTRWND.QMWN"},
+        "v10": {"obs_wspd_var": "MTRWND.WSPD", "obs_wdir_var": "MTRWND.WDIR", "obs_qc_var": "MTRWND.QMWN"},
     },
     "conv-adpsfc-NC000101": {
         "t2m": {"obs_var": "TEMHUMDA.TMDB", "obs_qc_var": "QMAT"},
+        "u10": {"obs_wspd_var": "BSYWND1.WSPD", "obs_wdir_var": "BSYWND1.WDIR", "obs_qc_var": "QMWN"},
+        "v10": {"obs_wspd_var": "BSYWND1.WSPD", "obs_wdir_var": "BSYWND1.WDIR", "obs_qc_var": "QMWN"},
     },
+}
+
+WIND_VARIABLES = {
+    "u":   {"group": "uv",   "component": "u"},
+    "v":   {"group": "uv",   "component": "v"},
+    "u10": {"group": "uv10", "component": "u"},
+    "v10": {"group": "uv10", "component": "v"},
 }
 
 DEFAULT_VARIABLES = {
     "t": {"levels": [850]},
     "gh": {"levels": [500]},
     "t2m": {},
+    "u": {"levels": [850]},
+    "v": {"levels": [850]},
+    "u10": {},
+    "v10": {},
 }
 
 
@@ -50,23 +71,12 @@ def build_variable_map(config):
     independent of any specific dataset.  Surface variables (no levels) get
     level=None.
 
+    Wind variables (listed in WIND_VARIABLES) use obs_wspd_col / obs_wdir_col
+    instead of obs_col; the final obs_col is derived later by
+    derive_wind_components.
+
     Returns:
-        dict: e.g. {
-            "t_850": {
-                "base_name": "t",
-                "level": 850,
-                "obs_col": "obs_t",
-                "obs_qc_col": "obs_qc_t",
-                "unit_conversion": "gp_to_gph" or None,
-            },
-            "t2m": {
-                "base_name": "t2m",
-                "level": None,
-                "obs_col": "obs_t2m",
-                "obs_qc_col": "obs_qc_t2m",
-                "unit_conversion": None,
-            },
-        }
+        dict keyed by forecast variable name (e.g. "t_850", "u_850", "v10").
     """
     # Collect all variable names available across all datasets
     all_registry_vars = set()
@@ -90,25 +100,52 @@ def build_variable_map(config):
                 break
 
         levels = vinfo.get("levels", None)
-        if levels:
-            for level in levels:
-                forecast_var = f"{base_name}_{level}"
+
+        if base_name in WIND_VARIABLES:
+            wind_info = WIND_VARIABLES[base_name]
+            group = wind_info["group"]
+            component = wind_info["component"]
+            wspd_col = f"obs_wspd_{group}"
+            wdir_col = f"obs_wdir_{group}"
+            qc_col = f"obs_qc_{group}"
+
+            def _add_wind_entry(forecast_var, level):
                 variable_map[forecast_var] = {
                     "base_name": base_name,
                     "level": level,
+                    "obs_wspd_col": wspd_col,
+                    "obs_wdir_col": wdir_col,
+                    "obs_qc_col": qc_col,
+                    "obs_col": f"obs_{forecast_var}",
+                    "wind_component": component,
+                    "unit_conversion": conversion,
+                }
+
+            if levels:
+                for level in levels:
+                    _add_wind_entry(f"{base_name}_{level}", level)
+            else:
+                _add_wind_entry(base_name, None)
+        else:
+            if levels:
+                for level in levels:
+                    forecast_var = f"{base_name}_{level}"
+                    variable_map[forecast_var] = {
+                        "base_name": base_name,
+                        "level": level,
+                        "obs_col": f"obs_{base_name}",
+                        "obs_qc_col": f"obs_qc_{base_name}",
+                        "unit_conversion": conversion,
+                    }
+            else:
+                # Surface variable — no levels
+                variable_map[base_name] = {
+                    "base_name": base_name,
+                    "level": None,
                     "obs_col": f"obs_{base_name}",
                     "obs_qc_col": f"obs_qc_{base_name}",
                     "unit_conversion": conversion,
                 }
-        else:
-            # Surface variable — no levels
-            variable_map[base_name] = {
-                "base_name": base_name,
-                "level": None,
-                "obs_col": f"obs_{base_name}",
-                "obs_qc_col": f"obs_qc_{base_name}",
-                "unit_conversion": conversion,
-            }
     return variable_map
 
 
@@ -131,38 +168,49 @@ def load_all_observations(time_range, variable_map):
     all_frames = []
 
     for dataset_name, registry in DATASET_REGISTRY.items():
-        # Determine which requested variables this dataset supports
-        supported = {}
+        # Build a unified rename_map (real col -> standardized col) for all
+        # requested variables supported by this dataset.
+        rename_map = {}
+        has_any = False
         for forecast_var, vinfo in variable_map.items():
             base_name = vinfo["base_name"]
             if base_name not in registry:
                 continue
+            has_any = True
             reg = registry[base_name]
             level = vinfo["level"]
-            if level is not None:
-                # Upper-air: construct PRLC-suffixed column names
-                prlc_suffix = f"PRLC{level * 100}"
-                real_obs_col = f"{reg['obs_var']}_{prlc_suffix}"
-                real_qc_col = f"{reg['obs_qc_var']}_{prlc_suffix}"
-            else:
-                # Surface: use dotted column names as-is
-                real_obs_col = reg["obs_var"]
-                real_qc_col = reg["obs_qc_var"]
-            supported[forecast_var] = {
-                "real_obs_col": real_obs_col,
-                "real_qc_col": real_qc_col,
-                "std_obs_col": vinfo["obs_col"],
-                "std_qc_col": vinfo["obs_qc_col"],
-            }
 
-        if not supported:
+            if "obs_wspd_col" in vinfo:
+                # Wind variable: map WSPD, WDIR, and QC columns
+                if level is not None:
+                    prlc_suffix = f"PRLC{level * 100}"
+                    real_wspd = f"{reg['obs_wspd_var']}_{prlc_suffix}"
+                    real_wdir = f"{reg['obs_wdir_var']}_{prlc_suffix}"
+                    real_qc = f"{reg['obs_qc_var']}_{prlc_suffix}"
+                else:
+                    real_wspd = reg["obs_wspd_var"]
+                    real_wdir = reg["obs_wdir_var"]
+                    real_qc = reg["obs_qc_var"]
+                rename_map[real_wspd] = vinfo["obs_wspd_col"]
+                rename_map[real_wdir] = vinfo["obs_wdir_col"]
+                rename_map[real_qc] = vinfo["obs_qc_col"]
+            else:
+                # Direct variable
+                if level is not None:
+                    prlc_suffix = f"PRLC{level * 100}"
+                    real_obs_col = f"{reg['obs_var']}_{prlc_suffix}"
+                    real_qc_col = f"{reg['obs_qc_var']}_{prlc_suffix}"
+                else:
+                    real_obs_col = reg["obs_var"]
+                    real_qc_col = reg["obs_qc_var"]
+                rename_map[real_obs_col] = vinfo["obs_col"]
+                rename_map[real_qc_col] = vinfo["obs_qc_col"]
+
+        if not has_any:
             continue
 
         # Build column list for this dataset
-        columns = ["LAT", "LON", "OBS_TIMESTAMP"]
-        for sinfo in supported.values():
-            columns.append(sinfo["real_obs_col"])
-            columns.append(sinfo["real_qc_col"])
+        columns = ["LAT", "LON", "OBS_TIMESTAMP"] + list(rename_map.keys())
         columns = list(dict.fromkeys(columns))  # deduplicate, preserve order
 
         ds = dc[dataset_name]
@@ -177,10 +225,6 @@ def load_all_observations(time_range, variable_map):
             continue
 
         # Rename real column names to standardized names
-        rename_map = {}
-        for sinfo in supported.values():
-            rename_map[sinfo["real_obs_col"]] = sinfo["std_obs_col"]
-            rename_map[sinfo["real_qc_col"]] = sinfo["std_qc_col"]
         obs_df = obs_df.rename(columns=rename_map)
 
         logger.info(f"Loaded {len(obs_df)} observations from {dataset_name}")
@@ -195,6 +239,9 @@ def load_all_observations(time_range, variable_map):
         for vinfo in variable_map.values():
             std_columns.append(vinfo["obs_col"])
             std_columns.append(vinfo["obs_qc_col"])
+            if "obs_wspd_col" in vinfo:
+                std_columns.append(vinfo["obs_wspd_col"])
+                std_columns.append(vinfo["obs_wdir_col"])
         std_columns = list(dict.fromkeys(std_columns))
         result = pd.DataFrame(columns=std_columns)
         logger.warning("No observations loaded from any dataset")
@@ -206,17 +253,70 @@ def apply_qc_filter(obs_df, variable_map, max_qc_value=2):
 
     Masks obs values to NaN where QC is non-NaN AND > max_qc_value.
     NaN QC means not flagged -> keep. 0-2 = good -> keep. 3+ = suspect/rejected -> mask.
+
+    For wind variables, masks the WSPD and WDIR source columns (obs_col
+    doesn't exist yet — it is derived later).
     """
     for forecast_var, vinfo in variable_map.items():
-        obs_col = vinfo["obs_col"]
         qc_col = vinfo["obs_qc_col"]
-        if qc_col in obs_df.columns and obs_col in obs_df.columns:
-            qc_vals = obs_df[qc_col]
-            bad = qc_vals.notna() & (qc_vals > max_qc_value)
-            n_rejected = bad.sum()
-            if n_rejected > 0:
-                logger.info(f"QC filter: masking {n_rejected} obs for {forecast_var} (QC > {max_qc_value})")
-            obs_df.loc[bad, obs_col] = np.nan
+        if qc_col not in obs_df.columns:
+            continue
+
+        qc_vals = obs_df[qc_col]
+        bad = qc_vals.notna() & (qc_vals > max_qc_value)
+        n_rejected = bad.sum()
+
+        if "obs_wspd_col" in vinfo:
+            # Wind variable: mask WSPD and WDIR source columns
+            cols_to_mask = [vinfo["obs_wspd_col"], vinfo["obs_wdir_col"]]
+            for col in cols_to_mask:
+                if col in obs_df.columns:
+                    if n_rejected > 0:
+                        logger.info(f"QC filter: masking {n_rejected} obs in {col} for {forecast_var} (QC > {max_qc_value})")
+                    obs_df.loc[bad, col] = np.nan
+        else:
+            obs_col = vinfo["obs_col"]
+            if obs_col in obs_df.columns:
+                if n_rejected > 0:
+                    logger.info(f"QC filter: masking {n_rejected} obs for {forecast_var} (QC > {max_qc_value})")
+                obs_df.loc[bad, obs_col] = np.nan
+    return obs_df
+
+
+def derive_wind_components(obs_df, variable_map):
+    """Derive u/v wind components from WSPD/WDIR columns.
+
+    For each wind variable in variable_map, computes:
+        u = -wspd * sin(wdir_rad)
+        v = -wspd * cos(wdir_rad)
+
+    Tracks already-derived (wspd_col, wdir_col) pairs to avoid duplicate work
+    when u and v share the same source columns.
+    """
+    derived = set()
+    for forecast_var, vinfo in variable_map.items():
+        if "obs_wspd_col" not in vinfo:
+            continue
+        wspd_col = vinfo["obs_wspd_col"]
+        wdir_col = vinfo["obs_wdir_col"]
+        obs_col = vinfo["obs_col"]
+        component = vinfo["wind_component"]
+
+        key = (wspd_col, wdir_col, component)
+        if key in derived:
+            continue
+        derived.add(key)
+
+        if wspd_col not in obs_df.columns or wdir_col not in obs_df.columns:
+            continue
+
+        wdir_rad = np.deg2rad(obs_df[wdir_col])
+        wspd = obs_df[wspd_col]
+        if component == "u":
+            obs_df[obs_col] = -wspd * np.sin(wdir_rad)
+        else:
+            obs_df[obs_col] = -wspd * np.cos(wdir_rad)
+        logger.info(f"Derived {obs_col} from {wspd_col}/{wdir_col}")
     return obs_df
 
 
@@ -404,6 +504,7 @@ def main(config):
         # QC filter and unit conversion
         obs_df = apply_qc_filter(obs_df, variable_map, max_qc_value=max_qc_value)
         obs_df = convert_obs_units(obs_df, variable_map)
+        obs_df = derive_wind_components(obs_df, variable_map)
 
         # Convert obs longitudes to 0-360 to match forecast convention
         obs_df["LON"] = obs_df["LON"] % 360
