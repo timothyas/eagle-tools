@@ -53,39 +53,40 @@ WIND_VARIABLES = {
     "v10": {"group": "uv10", "component": "v"},
 }
 
-DEFAULT_VARIABLES = {
-    "t": {"levels": [850]},
-    "gh": {"levels": [500]},
-    "t2m": {},
-    "u": {"levels": [850]},
-    "v": {"levels": [850]},
-    "u10": {},
-    "v10": {},
-}
+DEFAULT_VARIABLES = ["t", "gh", "t2m", "u", "v", "u10", "v10"]
+DEFAULT_LEVELS = [500, 850]
+
+
+def _is_upper_air(base_name):
+    """A variable is upper-air if it appears in any adpupa dataset."""
+    return any(
+        base_name in reg and "adpupa" in ds_name
+        for ds_name, reg in DATASET_REGISTRY.items()
+    )
 
 
 def build_variable_map(config):
-    """Expand config variables dict into a flat map keyed by forecast variable name.
+    """Expand config into a flat map keyed by forecast variable name.
 
-    Uses standardized obs column names (obs_{var}, obs_qc_{var}) that are
-    independent of any specific dataset.  Surface variables (no levels) get
-    level=None.
+    Reads a flat ``variables`` list and a ``levels`` list from config.
+    Upper-air variables (those appearing in any adpupa dataset) are expanded
+    across all levels; surface variables get a single entry with level=None.
 
-    Wind variables (listed in WIND_VARIABLES) use obs_wspd_col / obs_wdir_col
-    instead of obs_col; the final obs_col is derived later by
-    derive_wind_components.
+    Each entry uses level-specific obs column names so that multiple levels
+    can coexist in the same DataFrame without collisions.
 
     Returns:
         dict keyed by forecast variable name (e.g. "t_850", "u_850", "v10").
     """
-    # Collect all variable names available across all datasets
     all_registry_vars = set()
     for reg in DATASET_REGISTRY.values():
         all_registry_vars.update(reg.keys())
 
     variables = config.get("variables", DEFAULT_VARIABLES)
+    levels = config.get("levels", DEFAULT_LEVELS)
     variable_map = {}
-    for base_name, vinfo in variables.items():
+
+    for base_name in variables:
         if base_name not in all_registry_vars:
             raise ValueError(
                 f"Variable '{base_name}' is not available in any dataset. "
@@ -99,53 +100,44 @@ def build_variable_map(config):
                 conversion = reg[base_name].get("unit_conversion", None)
                 break
 
-        levels = vinfo.get("levels", None)
+        upper_air = _is_upper_air(base_name)
 
-        if base_name in WIND_VARIABLES:
-            wind_info = WIND_VARIABLES[base_name]
-            group = wind_info["group"]
-            component = wind_info["component"]
-            wspd_col = f"obs_wspd_{group}"
-            wdir_col = f"obs_wdir_{group}"
-            qc_col = f"obs_qc_{group}"
-
-            def _add_wind_entry(forecast_var, level):
-                variable_map[forecast_var] = {
+        if upper_air and levels:
+            for level in levels:
+                forecast_var = f"{base_name}_{level}"
+                entry = {
                     "base_name": base_name,
                     "level": level,
-                    "obs_wspd_col": wspd_col,
-                    "obs_wdir_col": wdir_col,
-                    "obs_qc_col": qc_col,
-                    "obs_col": f"obs_{forecast_var}",
-                    "wind_component": component,
+                    "obs_col": f"obs_{base_name}_{level}",
+                    "obs_qc_col": f"obs_qc_{base_name}_{level}",
                     "unit_conversion": conversion,
                 }
-
-            if levels:
-                for level in levels:
-                    _add_wind_entry(f"{base_name}_{level}", level)
-            else:
-                _add_wind_entry(base_name, None)
+                if base_name in WIND_VARIABLES:
+                    wind_info = WIND_VARIABLES[base_name]
+                    group = wind_info["group"]
+                    entry["obs_wspd_col"] = f"obs_wspd_{group}_{level}"
+                    entry["obs_wdir_col"] = f"obs_wdir_{group}_{level}"
+                    entry["obs_qc_col"] = f"obs_qc_{group}_{level}"
+                    entry["wind_component"] = wind_info["component"]
+                variable_map[forecast_var] = entry
         else:
-            if levels:
-                for level in levels:
-                    forecast_var = f"{base_name}_{level}"
-                    variable_map[forecast_var] = {
-                        "base_name": base_name,
-                        "level": level,
-                        "obs_col": f"obs_{base_name}",
-                        "obs_qc_col": f"obs_qc_{base_name}",
-                        "unit_conversion": conversion,
-                    }
-            else:
-                # Surface variable — no levels
-                variable_map[base_name] = {
-                    "base_name": base_name,
-                    "level": None,
-                    "obs_col": f"obs_{base_name}",
-                    "obs_qc_col": f"obs_qc_{base_name}",
-                    "unit_conversion": conversion,
-                }
+            # Surface variable — no levels
+            entry = {
+                "base_name": base_name,
+                "level": None,
+                "obs_col": f"obs_{base_name}",
+                "obs_qc_col": f"obs_qc_{base_name}",
+                "unit_conversion": conversion,
+            }
+            if base_name in WIND_VARIABLES:
+                wind_info = WIND_VARIABLES[base_name]
+                group = wind_info["group"]
+                entry["obs_wspd_col"] = f"obs_wspd_{group}"
+                entry["obs_wdir_col"] = f"obs_wdir_{group}"
+                entry["obs_qc_col"] = f"obs_qc_{group}"
+                entry["wind_component"] = wind_info["component"]
+            variable_map[base_name] = entry
+
     return variable_map
 
 
@@ -544,11 +536,31 @@ def main(config):
                 for metric in container.keys():
                     container_per_ic[metric][varname].append(result[metric])
 
-        # Assemble into xr.Dataset
+        # Assemble into xr.Dataset, grouping upper-air variables by base
+        # name with a level dimension
         for metric, thedata in container_per_ic.items():
-            data_vars = {}
+            base_groups = {}
             for varname, vals in thedata.items():
-                data_vars[varname] = xr.concat(vals, dim="time")
+                vinfo = variable_map[varname]
+                bn = vinfo["base_name"]
+                level = vinfo["level"]
+                time_concat = xr.concat(vals, dim="time")
+                if bn not in base_groups:
+                    base_groups[bn] = {}
+                base_groups[bn][level] = time_concat
+
+            data_vars = {}
+            for bn, level_dict in base_groups.items():
+                if None in level_dict:
+                    # Surface variable — no level dimension
+                    data_vars[bn] = level_dict[None]
+                else:
+                    # Upper-air variable — stack levels
+                    level_arrays = []
+                    for lvl in sorted(level_dict.keys()):
+                        arr = level_dict[lvl].expand_dims({"level": [lvl]})
+                        level_arrays.append(arr)
+                    data_vars[bn] = xr.concat(level_arrays, dim="level")
 
             this_metric_ds = postprocess(xr.Dataset(data_vars))
             container[metric].append(this_metric_ds)
