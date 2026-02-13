@@ -1,4 +1,5 @@
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import xarray as xr
@@ -144,12 +145,72 @@ def build_variable_map(config):
     return variable_map
 
 
+def _build_rename_map(registry, variable_map):
+    """Build real-col -> standardized-col rename map for one dataset."""
+    rename_map = {}
+    for forecast_var, vinfo in variable_map.items():
+        base_name = vinfo["base_name"]
+        if base_name not in registry:
+            continue
+        reg = registry[base_name]
+        level = vinfo["level"]
+
+        if "obs_wspd_col" in vinfo:
+            # Wind variable: map WSPD, WDIR, and QC columns
+            if level is not None:
+                prlc_suffix = f"PRLC{level * 100}"
+                real_wspd = f"{reg['obs_wspd_var']}_{prlc_suffix}"
+                real_wdir = f"{reg['obs_wdir_var']}_{prlc_suffix}"
+                real_qc = f"{reg['obs_qc_var']}_{prlc_suffix}"
+            else:
+                real_wspd = reg["obs_wspd_var"]
+                real_wdir = reg["obs_wdir_var"]
+                real_qc = reg["obs_qc_var"]
+            rename_map[real_wspd] = vinfo["obs_wspd_col"]
+            rename_map[real_wdir] = vinfo["obs_wdir_col"]
+            rename_map[real_qc] = vinfo["obs_qc_col"]
+        else:
+            # Direct variable
+            if level is not None:
+                prlc_suffix = f"PRLC{level * 100}"
+                real_obs_col = f"{reg['obs_var']}_{prlc_suffix}"
+                real_qc_col = f"{reg['obs_qc_var']}_{prlc_suffix}"
+            else:
+                real_obs_col = reg["obs_var"]
+                real_qc_col = reg["obs_qc_var"]
+            rename_map[real_obs_col] = vinfo["obs_col"]
+            rename_map[real_qc_col] = vinfo["obs_qc_col"]
+    return rename_map
+
+
+def _load_one_dataset(dc, dataset_name, rename_map, time_range):
+    """Load and rename observations from a single dataset."""
+    columns = ["LAT", "LON", "OBS_TIMESTAMP"] + list(rename_map.keys())
+    columns = list(dict.fromkeys(columns))  # deduplicate, preserve order
+
+    ds = dc[dataset_name]
+    try:
+        subds = ds.sel(
+            time=slice(str(time_range[0]), str(time_range[1])),
+            variables=columns,
+        )
+        obs_df = subds.load_dataset()
+    except nnja_ai.exceptions.EmptyTimeSubsetError:
+        logger.warning(f"No observations in {dataset_name} for {time_range[0]} to {time_range[1]}")
+        return None
+
+    obs_df = obs_df.rename(columns=rename_map)
+    logger.info(f"Loaded {len(obs_df)} observations from {dataset_name}")
+    return obs_df
+
+
 def load_all_observations(time_range, variable_map):
     """Load observations from all datasets in DATASET_REGISTRY.
 
     For each dataset, determines which user-requested variables it supports,
     builds the real column names, loads from nnja_ai, renames to standardized
-    names, and concatenates all DataFrames.
+    names, and concatenates all DataFrames.  Datasets are loaded in parallel
+    using threads since the work is I/O-bound.
 
     Args:
         time_range: (start, end) tuple of pd.Timestamps for time selection.
@@ -160,70 +221,24 @@ def load_all_observations(time_range, variable_map):
         obs/QC columns (obs_{var}, obs_qc_{var}).
     """
     dc = nnja_ai.DataCatalog()
-    all_frames = []
 
+    # Pre-compute rename maps and filter to datasets that have matching vars
+    tasks = {}
     for dataset_name, registry in DATASET_REGISTRY.items():
-        # Build a unified rename_map (real col -> standardized col) for all
-        # requested variables supported by this dataset.
-        rename_map = {}
-        has_any = False
-        for forecast_var, vinfo in variable_map.items():
-            base_name = vinfo["base_name"]
-            if base_name not in registry:
-                continue
-            has_any = True
-            reg = registry[base_name]
-            level = vinfo["level"]
+        rename_map = _build_rename_map(registry, variable_map)
+        if rename_map:
+            tasks[dataset_name] = rename_map
 
-            if "obs_wspd_col" in vinfo:
-                # Wind variable: map WSPD, WDIR, and QC columns
-                if level is not None:
-                    prlc_suffix = f"PRLC{level * 100}"
-                    real_wspd = f"{reg['obs_wspd_var']}_{prlc_suffix}"
-                    real_wdir = f"{reg['obs_wdir_var']}_{prlc_suffix}"
-                    real_qc = f"{reg['obs_qc_var']}_{prlc_suffix}"
-                else:
-                    real_wspd = reg["obs_wspd_var"]
-                    real_wdir = reg["obs_wdir_var"]
-                    real_qc = reg["obs_qc_var"]
-                rename_map[real_wspd] = vinfo["obs_wspd_col"]
-                rename_map[real_wdir] = vinfo["obs_wdir_col"]
-                rename_map[real_qc] = vinfo["obs_qc_col"]
-            else:
-                # Direct variable
-                if level is not None:
-                    prlc_suffix = f"PRLC{level * 100}"
-                    real_obs_col = f"{reg['obs_var']}_{prlc_suffix}"
-                    real_qc_col = f"{reg['obs_qc_var']}_{prlc_suffix}"
-                else:
-                    real_obs_col = reg["obs_var"]
-                    real_qc_col = reg["obs_qc_var"]
-                rename_map[real_obs_col] = vinfo["obs_col"]
-                rename_map[real_qc_col] = vinfo["obs_qc_col"]
-
-        if not has_any:
-            continue
-
-        # Build column list for this dataset
-        columns = ["LAT", "LON", "OBS_TIMESTAMP"] + list(rename_map.keys())
-        columns = list(dict.fromkeys(columns))  # deduplicate, preserve order
-
-        ds = dc[dataset_name]
-        try:
-            subds = ds.sel(
-                time=slice(str(time_range[0]), str(time_range[1])),
-                variables=columns,
-            )
-            obs_df = subds.load_dataset()
-        except nnja_ai.exceptions.EmptyTimeSubsetError:
-            logger.warning(f"No observations in {dataset_name} for {time_range[0]} to {time_range[1]}")
-            continue
-
-        # Rename real column names to standardized names
-        obs_df = obs_df.rename(columns=rename_map)
-
-        logger.info(f"Loaded {len(obs_df)} observations from {dataset_name}")
-        all_frames.append(obs_df)
+    all_frames = []
+    with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+        futures = {
+            pool.submit(_load_one_dataset, dc, ds_name, rmap, time_range): ds_name
+            for ds_name, rmap in tasks.items()
+        }
+        for future in as_completed(futures):
+            obs_df = future.result()
+            if obs_df is not None:
+                all_frames.append(obs_df)
 
     if all_frames:
         result = pd.concat(all_frames, ignore_index=True)
