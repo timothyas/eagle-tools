@@ -17,23 +17,24 @@ UNIT_CONVERSIONS = {
     "gp_to_gph": lambda x: x / GRAVITY,
 }
 
-DEFAULT_VARIABLES = {
-    "t": {
-        "obs_var": "TMDB",
-        "obs_qc_var": "QMAT",
-        "levels": [850],
-    },
-    "gh": {
-        "obs_var": "GP10",
-        "obs_qc_var": "QMGP",
-        "levels": [500],
-        "unit_conversion": "gp_to_gph",
+DATASET_REGISTRY = {
+    "conv-adpupa-NC002001": {
+        "t": {"obs_var": "TMDB", "obs_qc_var": "QMAT"},
+        "gh": {"obs_var": "GP10", "obs_qc_var": "QMGP", "unit_conversion": "gp_to_gph"},
     },
 }
 
+DEFAULT_VARIABLES = {
+    "t": {"levels": [850]},
+    "gh": {"levels": [500]},
+}
 
-def build_variable_map(config):
+
+def build_variable_map(config, obs_dataset):
     """Expand config variables dict into a flat map keyed by forecast variable name.
+
+    Merges user config (levels) with dataset-specific info (obs_var, obs_qc_var,
+    unit_conversion) from DATASET_REGISTRY.
 
     Returns:
         dict: e.g. {
@@ -49,12 +50,25 @@ def build_variable_map(config):
             },
         }
     """
+    if obs_dataset not in DATASET_REGISTRY:
+        raise ValueError(
+            f"Unknown obs_dataset '{obs_dataset}'. "
+            f"Available datasets: {list(DATASET_REGISTRY.keys())}"
+        )
+    registry = DATASET_REGISTRY[obs_dataset]
+
     variables = config.get("variables", DEFAULT_VARIABLES)
     variable_map = {}
     for base_name, vinfo in variables.items():
-        obs_var = vinfo["obs_var"]
-        obs_qc_var = vinfo["obs_qc_var"]
-        conversion = vinfo.get("unit_conversion", None)
+        if base_name not in registry:
+            raise ValueError(
+                f"Variable '{base_name}' is not available for dataset '{obs_dataset}'. "
+                f"Available variables: {list(registry.keys())}"
+            )
+        reg = registry[base_name]
+        obs_var = reg["obs_var"]
+        obs_qc_var = reg["obs_qc_var"]
+        conversion = reg.get("unit_conversion", None)
         for level in vinfo["levels"]:
             forecast_var = f"{base_name}_{level}"
             prlc_suffix = f"PRLC{level * 100}"
@@ -199,7 +213,8 @@ def main(config):
     topo = config["topo"]
 
     # Build variable map
-    variable_map = build_variable_map(config)
+    obs_dataset = config.get("obs_dataset", "conv-adpupa-NC002001")
+    variable_map = build_variable_map(config, obs_dataset)
     forecast_var_names = list(variable_map.keys())
     # Extract unique base variable names and levels for loading the forecast
     base_var_names = list({vinfo["base_name"] for vinfo in variable_map.values()})
@@ -210,7 +225,6 @@ def main(config):
     model_type = config.get("model_type")
     lam_index = config.get("lam_index", None)
     lead_time = config["lead_time"]
-    obs_dataset = config.get("obs_dataset", "conv-adpupa-NC002001")
     temporal_window = pd.Timedelta(config.get("temporal_window", "3h"))
     max_qc_value = config.get("max_qc_value", 2)
 
