@@ -9,6 +9,7 @@ import nnja_ai
 
 from eagle.tools.data import open_anemoi_inference_dataset, open_forecast_zarr_dataset
 from eagle.tools.metrics import postprocess
+from eagle.tools.nested import prepare_regrid_target_mask
 
 logger = logging.getLogger("eagle.tools")
 
@@ -502,9 +503,7 @@ def main(config):
             fds["longitude"] = plon
 
         # Get forecast valid times
-        logger.info(f"Opened fds\n{fds}")
         forecast_valid_times = fds["time"].values
-        logger.info(f"vtimes: {forecast_valid_times}")
 
         # Load observations for the full valid time range (padded by window)
         time_start = pd.Timestamp(forecast_valid_times[0]) - temporal_window
@@ -537,7 +536,6 @@ def main(config):
                         container_per_ic[metric][varname].append(fillds)
                 continue
 
-            # TODO: maybe do this conversion earlier?
             matched_obs = aligned[vtimestamp].to_xarray()
 
             # Interp to obs locations and compute metrics
