@@ -5,6 +5,7 @@ import numpy as np
 import xarray as xr
 import pandas as pd
 
+import xesmf
 import nnja_ai
 
 from eagle.tools.data import open_anemoi_inference_dataset, open_forecast_zarr_dataset
@@ -369,15 +370,44 @@ def align_obs_to_forecast_times(obs_df, forecast_valid_times, window):
     return aligned
 
 
-def compute_obs_metrics(forecast_values, obs_values):
+def _interp_to_obs_locations(fds_time_slice, matched_obs_df):
+    """Interpolate a forecast time-slice to observation locations using xesmf.
+
+    Args:
+        fds_time_slice: xr.Dataset for a single time (no time dim), with
+            ``latitude`` and ``longitude`` coordinates.
+        matched_obs_df: pandas DataFrame with ``LAT`` and ``LON`` columns.
+
+    Returns:
+        xr.Dataset interpolated to observation locations (dim ``locations``).
+    """
+    src = fds_time_slice.rename({"latitude": "lat", "longitude": "lon"})
+
+    obs_loc = xr.Dataset({
+        "lat": xr.DataArray(matched_obs_df["LAT"].values, dims=("locations",)),
+        "lon": xr.DataArray(matched_obs_df["LON"].values, dims=("locations",)),
+    })
+
+    regridder = xesmf.Regridder(
+        src,
+        obs_loc,
+        method="bilinear",
+        locstream_out=True,
+        unmapped_to_nan=True,
+    )
+    return regridder(src)
+
+
+def compute_obs_metrics(forecast_values, obs_values, vtime):
     """Compute verification metrics between forecast and observation values.
 
     Args:
-        forecast_values: Array of forecast values at obs locations.
-        obs_values: Array of observation values.
+        forecast_values: 1-D numpy array of forecast values at obs locations.
+        obs_values: 1-D numpy array of observation values.
+        vtime: numpy datetime64 valid time for the time coordinate.
 
     Returns:
-        dict with rmse, mae, bias, count.
+        xr.Dataset with rmse, mae, bias, count and a time dimension.
     """
     valid = np.isfinite(forecast_values) & np.isfinite(obs_values)
     n = valid.sum()
@@ -394,9 +424,7 @@ def compute_obs_metrics(forecast_values, obs_values):
             "count": int(n),
         }
     xds = xr.Dataset(result)
-    xds = xds.expand_dims({"time": [forecast_values["time"].values]})
-#    if "level" in forecast_values.coords:
-#        xds = xds.expand_dims({"level": [forecast_values["level"].values]})
+    xds = xds.expand_dims({"time": [vtime]})
     return xds
 
 
@@ -491,17 +519,6 @@ def main(config):
                 lcc_info=config.get("lcc_info", None),
             )
 
-        # Pad in longitude
-        if "global" in model_type:
-            dlon = fds["longitude"].diff("longitude").values[0]
-            fds = fds.pad({"longitude": 1}, mode="wrap")
-            plon = np.concatenate([
-                [fds["longitude"][1].values - dlon],
-                fds["longitude"].values[1:-1],
-                [fds["longitude"][-2].values + dlon],
-            ])
-            fds["longitude"] = plon
-
         # Get forecast valid times
         forecast_valid_times = fds["time"].values
 
@@ -536,19 +553,20 @@ def main(config):
                         container_per_ic[metric][varname].append(fillds)
                 continue
 
-            matched_obs = aligned[vtimestamp].to_xarray()
+            matched_obs = aligned[vtimestamp]
 
             # Interp to obs locations and compute metrics
-            interpolated = fds.sel(time=vtime).interp({
-                "longitude": matched_obs["LON"],
-                "latitude": matched_obs["LAT"],
-            })
+            interpolated = _interp_to_obs_locations(fds.sel(time=vtime), matched_obs)
             for varname, vinfo in variable_map.items():
                 fvals = interpolated[vinfo["base_name"]]
                 if "level" in fvals.dims:
                     fvals = fvals.sel(level=vinfo["level"])
 
-                result = compute_obs_metrics(fvals, matched_obs[vinfo["obs_col"]])
+                result = compute_obs_metrics(
+                    fvals.values,
+                    matched_obs[vinfo["obs_col"]].values,
+                    vtime,
+                )
                 for metric in container.keys():
                     container_per_ic[metric][varname].append(result[metric])
 
