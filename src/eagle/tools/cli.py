@@ -527,6 +527,92 @@ obs_metrics.help = """Verify forecasts against real observations (e.g., radioson
     """
 
 
+@cli.command("spatial-obs-metrics")
+@click.argument('config_file', type=click.Path(exists=True))
+def spatial_obs_metrics(config_file):
+    """Compute spatial maps of metrics against observations."""
+    from eagle.tools.spatial_obs_metrics import main
+    main(config_file)
+
+spatial_obs_metrics.help = """Compute spatial maps of forecast error against real observations.
+
+    \b
+    This is the spatial analogue of ``obs-metrics``. Instead of reducing space to
+    a single number per forecast hour, it keeps a user-defined latitude/longitude
+    grid and accumulates a running average over all initial condition dates
+    (there is no per-initial-condition output option). For each initial
+    condition, the forecast is interpolated to the (heterogeneous) observation
+    locations, the per-observation error is computed, and those errors are binned
+    to the nearest cell of the target grid. RMSE, MAE, bias, and observation
+    count maps are written, with dims (fhr, [level,] latitude, longitude).
+
+    \b
+    Note:
+        Only deterministic forecasts are supported (n_members must be 1).
+
+    \b
+    Note:
+        Observations are loaded from nnja_ai.DataCatalog (parquet from GCS).
+        Quality control filtering is applied per-variable using NCEP PREPBUFR codes.
+        Observation datasets and variable mappings are defined in
+        config/obs_metrics.yaml.
+
+    \b
+    Note:
+        The arguments documented here are passed via a config dictionary.
+
+    \b
+    Config Args:
+        forecast_path (str): The directory path containing the forecast datasets.
+        \b
+        lead_time (int): Length of forecast in hours.
+        \b
+        output_path (str): The directory where output NetCDF files will be saved, as
+            f"{output_path}/spatial.{metric}.convobs.{model_type}.nc"
+        \b
+        start_date (str): The first initial condition date to process.
+        \b
+        end_date (str): The last initial condition date to process.
+        \b
+        freq (str): Frequency string for the date range (e.g., "12h").
+        \b
+        d_lat (float): Latitude spacing (degrees) of the target grid.
+        \b
+        d_lon (float, optional): Longitude spacing (degrees) of the target grid.
+            Defaults to d_lat.
+        \b
+        vars_of_interest (list[str]): Variable names to verify. Names are mapped to
+            canonical names via config/rename.yaml. Derived variables like wind_speed
+            and 10m_wind_speed are supported (include their components too, e.g. u, v).
+        \b
+        levels (list[int], optional): Pressure levels (hPa) for upper-air variables.
+            If not provided, all levels present in the forecast dataset are used.
+        \b
+        model_type (str, optional): The type of model grid. Must contain "global"
+            (uses xesmf.util.grid_global) or "lam" (uses xesmf.util.grid_2d sized to
+            the forecast extent). Defaults to "global".
+        \b
+        temporal_window (str, optional): Time window (+/-) for matching obs to forecast
+            valid times. Defaults to "30min".
+        \b
+        max_qc_value (int, optional): Keep obs with QC flag <= this value. NaN QC flags
+            are always kept. Defaults to 2.
+        \b
+        from_anemoi (bool, optional): If True, opens forecast data using the anemoi
+            inference dataset format. Defaults to True.
+        \b
+        lam_index (int, optional): Index for LAM selection in nested models.
+        \b
+        lcc_info (dict, optional): Lambert Conformal Conic projection details for LAM grids.
+        \b
+        trim_forecast_edge (list[int], optional): Additional edge trimming for LAM grids.
+        \b
+        use_mpi (bool, optional): If True, distribute initialization dates across MPI ranks.
+        \b
+        log_path (str, optional): When using MPI, the directory for per-rank log files.
+    """
+
+
 @cli.command()
 @click.option('--offline_path', required=True, type=click.Path(exists=True), help='Path to the experiment mlflow logs')
 @click.option('--local_id', required=True, type=str, help='The generated 18 character experiment ID')
