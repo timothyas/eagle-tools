@@ -43,7 +43,7 @@ logger = logging.getLogger("eagle.tools")
 COMPONENTS = ("sum_err", "sum_sq_err", "sum_abs_err", "count")
 
 
-def build_target_grid(fds, model_type, d_lat, d_lon=None):
+def build_target_grid(fds, model_type, d_lat, d_lon=None, lat_bounds=None, lon_bounds=None):
     """Build the target grid the observation errors are binned onto.
 
     Args:
@@ -53,12 +53,37 @@ def build_target_grid(fds, model_type, d_lat, d_lon=None):
             global grid; ``"lam"`` selects a regional grid sized to the forecast.
         d_lat: Latitude grid spacing in degrees.
         d_lon: Longitude grid spacing in degrees. Defaults to ``d_lat``.
+        lat_bounds: Optional ``(min, max)`` latitude box (degrees) to restrict the
+            grid to. Clipped to the forecast extent.
+        lon_bounds: Optional ``(min, max)`` longitude box (degrees, ``[0, 360)``,
+            ``min < max``) to restrict the grid to. Clipped to the forecast extent.
 
     Returns:
         xr.Dataset from xesmf describing the target grid.
     """
     if d_lon is None:
         d_lon = d_lat
+
+    # When the user asks for a region, grid only that box (clipped to the forecast
+    # extent) regardless of model type. This is the path for verifying a limited
+    # area of an otherwise global forecast.
+    if lat_bounds is not None or lon_bounds is not None:
+        flat = fds["latitude"].values
+        flon = fds["longitude"].values % 360
+        lat_lo, lat_hi = lat_bounds if lat_bounds is not None else (
+            float(np.nanmin(flat)), float(np.nanmax(flat)))
+        lon_lo, lon_hi = lon_bounds if lon_bounds is not None else (
+            float(np.nanmin(flon)), float(np.nanmax(flon)))
+        lat_lo = max(lat_lo, float(np.nanmin(flat)))
+        lat_hi = min(lat_hi, float(np.nanmax(flat)))
+        lon_lo = max(lon_lo, float(np.nanmin(flon)))
+        lon_hi = min(lon_hi, float(np.nanmax(flon)))
+        if not (lat_lo < lat_hi and lon_lo < lon_hi):
+            raise ValueError(
+                "Requested region does not overlap the forecast extent "
+                f"(lat {lat_lo}-{lat_hi}, lon {lon_lo}-{lon_hi})"
+            )
+        return xesmf.util.grid_2d(lon_lo, lon_hi, d_lon, lat_lo, lat_hi, d_lat)
 
     if "global" in model_type:
         return xesmf.util.grid_global(d_lon, d_lat, cf=True, lon1=360)
@@ -70,6 +95,56 @@ def build_target_grid(fds, model_type, d_lat, d_lon=None):
             float(np.nanmin(lat)), float(np.nanmax(lat)), d_lat,
         )
     raise NotImplementedError(f"model_type '{model_type}' must contain 'global' or 'lam'")
+
+
+def _subset_forecast_to_bounds(fds, lat_bounds, lon_bounds):
+    """Restrict a forecast to a latitude/longitude box, padded for interpolation.
+
+    Only applies to forecasts laid out on 1-D ``latitude``/``longitude`` dimension
+    coordinates (i.e. a regular global grid). Curvilinear forecasts (e.g. a LAM on
+    ``y``/``x``) are returned unchanged -- the observation filter still limits the
+    region for those.
+
+    The box is padded by a couple of native grid cells so that the bilinear
+    interpolation onto observation points near the edge of the box still has a
+    surrounding stencil of forecast cells.
+    """
+    if "latitude" not in fds.dims or "longitude" not in fds.dims:
+        return fds
+
+    def _pad(coord):
+        diffs = np.abs(np.diff(np.unique(coord.values)))
+        return 2.0 * float(np.median(diffs)) if diffs.size else 0.0
+
+    if lat_bounds is not None:
+        lo, hi = lat_bounds
+        pad = _pad(fds["latitude"])
+        mask = (fds["latitude"] >= lo - pad) & (fds["latitude"] <= hi + pad)
+        fds = fds.sel(latitude=fds["latitude"][mask.values])
+
+    if lon_bounds is not None:
+        lo, hi = lon_bounds
+        pad = _pad(fds["longitude"])
+        lon360 = fds["longitude"] % 360
+        mask = (lon360 >= lo - pad) & (lon360 <= hi + pad)
+        fds = fds.sel(longitude=fds["longitude"][mask.values])
+
+    return fds
+
+
+def _filter_obs_to_bounds(obs_df, lat_bounds, lon_bounds):
+    """Drop observations outside the requested latitude/longitude box.
+
+    Assumes ``LON`` has already been wrapped into ``[0, 360)`` to match the
+    forecast convention, and ``lon_bounds`` is a contiguous ``min < max`` box.
+    """
+    if lat_bounds is not None:
+        lo, hi = lat_bounds
+        obs_df = obs_df[(obs_df["LAT"] >= lo) & (obs_df["LAT"] <= hi)]
+    if lon_bounds is not None:
+        lo, hi = lon_bounds
+        obs_df = obs_df[(obs_df["LON"] >= lo) & (obs_df["LON"] <= hi)]
+    return obs_df
 
 
 def _grid_centers(grid):
@@ -274,6 +349,25 @@ def main(config):
     d_lat = config["d_lat"]
     d_lon = config.get("d_lon", None)
 
+    # Optional region of interest: restrict the forecast, observations, and target
+    # grid to this latitude/longitude box. Longitude is in [0, 360) with min < max
+    # (a contiguous box that does not wrap across the 0/360 seam).
+    lat_bounds = config.get("latitude_bounds", None)
+    lon_bounds = config.get("longitude_bounds", None)
+    if lat_bounds is not None:
+        lat_bounds = (float(lat_bounds[0]), float(lat_bounds[1]))
+        if not lat_bounds[0] < lat_bounds[1]:
+            raise ValueError(f"latitude_bounds must be (min, max) with min < max, got {lat_bounds}")
+    if lon_bounds is not None:
+        lon_bounds = (float(lon_bounds[0]) % 360, float(lon_bounds[1]) % 360)
+        if not lon_bounds[0] < lon_bounds[1]:
+            raise ValueError(
+                "longitude_bounds must be a contiguous (min, max) box in [0, 360) "
+                f"with min < max (wrapping across 0/360 is not supported), got {lon_bounds}"
+            )
+    if lat_bounds is not None or lon_bounds is not None:
+        logger.info(f"Restricting to region: latitude={lat_bounds}, longitude={lon_bounds}")
+
     if config.get("n_members", 1) > 1:
         raise NotImplementedError("spatial-obs-metrics supports deterministic forecasts only")
 
@@ -317,6 +411,8 @@ def main(config):
         logger.info(f"Processing {st0}")
 
         fds = _load_forecast(config, t0, 0, levels, derived_var_names=derived_var_names)
+        if lat_bounds is not None or lon_bounds is not None:
+            fds = _subset_forecast_to_bounds(fds, lat_bounds, lon_bounds)
         forecast_valid_times = fds["time"].values
 
         # One-time setup once we know the forecast grid, levels, and variables
@@ -328,7 +424,8 @@ def main(config):
             forecast_var_names = list(variable_map.keys())
             logger.info(f"Variables to verify: {forecast_var_names}")
 
-            lat, lon = _grid_centers(build_target_grid(fds, model_type, d_lat, d_lon))
+            lat, lon = _grid_centers(build_target_grid(
+                fds, model_type, d_lat, d_lon, lat_bounds=lat_bounds, lon_bounds=lon_bounds))
             fhr_coord = (
                 (forecast_valid_times - np.datetime64(t0)) / np.timedelta64(1, "h")
             ).astype(int)
@@ -349,6 +446,8 @@ def main(config):
         obs_df = convert_dewpoint_to_specific_humidity(obs_df, variable_map)
         obs_df = derive_wind_components(obs_df, variable_map)
         obs_df["LON"] = obs_df["LON"] % 360
+        if lat_bounds is not None or lon_bounds is not None:
+            obs_df = _filter_obs_to_bounds(obs_df, lat_bounds, lon_bounds)
 
         aligned = align_obs_to_forecast_times(obs_df, forecast_valid_times, temporal_window)
 

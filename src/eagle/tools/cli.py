@@ -592,6 +592,17 @@ spatial_obs_metrics.help = """Compute spatial maps of forecast error against rea
             (uses xesmf.util.grid_global) or "lam" (uses xesmf.util.grid_2d sized to
             the forecast extent). Defaults to "global".
         \b
+        latitude_bounds (list[float], optional): [min, max] latitude box (degrees) to
+            restrict the verification to. Limits the forecast, the observations, and
+            the target grid (which becomes an xesmf.util.grid_2d over the box clipped
+            to the forecast extent). Use this to verify a limited region of an
+            otherwise global forecast. If omitted, the full domain is used.
+        \b
+        longitude_bounds (list[float], optional): [min, max] longitude box (degrees)
+            to restrict the verification to. Interpreted in [0, 360) with min < max
+            (a contiguous box that does not wrap across the 0/360 seam). Same effect
+            as latitude_bounds.
+        \b
         temporal_window (str, optional): Time window (+/-) for matching obs to forecast
             valid times. Defaults to "30min".
         \b
