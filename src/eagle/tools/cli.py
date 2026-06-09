@@ -538,13 +538,17 @@ spatial_obs_metrics.help = """Compute spatial maps of forecast error against rea
 
     \b
     This is the spatial analogue of ``obs-metrics``. Instead of reducing space to
-    a single number per forecast hour, it keeps a user-defined latitude/longitude
-    grid and accumulates a running average over all initial condition dates
-    (there is no per-initial-condition output option). For each initial
-    condition, the forecast is interpolated to the (heterogeneous) observation
-    locations, the per-observation error is computed, and those errors are binned
-    to the nearest cell of the target grid. RMSE, MAE, bias, and observation
-    count maps are written, with dims (fhr, [level,] latitude, longitude).
+    a single number per forecast hour, it keeps a per-station accumulation and
+    averages over all initial condition dates (there is no per-initial-condition
+    output option). For each initial condition, the forecast is interpolated to
+    the (heterogeneous) observation locations, the per-observation error is
+    computed, and those errors are aggregated by station -- the observation's own
+    location rounded to ``round_decimals`` decimal degrees. Keying on the observed
+    location (rather than snapping to a model grid) means forecasts verified
+    against the same obs network share an identical station axis, so their errors
+    can be differenced directly with no regridding. RMSE, MAE, bias, and
+    observation count are written, with dims (fhr, [level,] station) and
+    latitude/longitude coordinates on the station axis.
 
     \b
     Note:
@@ -576,10 +580,14 @@ spatial_obs_metrics.help = """Compute spatial maps of forecast error against rea
         \b
         freq (str): Frequency string for the date range (e.g., "12h").
         \b
-        d_lat (float): Latitude spacing (degrees) of the target grid.
+        round_decimals (int, optional): Decimal degrees to round observation
+            locations to when forming station ids (3 ~ 100 m). Observations that
+            round to the same latitude/longitude are treated as one station.
+            Defaults to 3.
         \b
-        d_lon (float, optional): Longitude spacing (degrees) of the target grid.
-            Defaults to d_lat.
+        fhrs (list[int], optional): Subset of forecast hours to verify (e.g.
+            [0, 24]). Defaults to all forecast hours present. Restricting this
+            also shrinks the per-initial-condition observation-loading window.
         \b
         vars_of_interest (list[str]): Variable names to verify. Names are mapped to
             canonical names via config/rename.yaml. Derived variables like wind_speed
@@ -588,15 +596,13 @@ spatial_obs_metrics.help = """Compute spatial maps of forecast error against rea
         levels (list[int], optional): Pressure levels (hPa) for upper-air variables.
             If not provided, all levels present in the forecast dataset are used.
         \b
-        model_type (str, optional): The type of model grid. Must contain "global"
-            (uses xesmf.util.grid_global) or "lam" (uses xesmf.util.grid_2d sized to
-            the forecast extent). Defaults to "global".
+        model_type (str, optional): Tag used only in the output filename
+            (f"spatial.{metric}.convobs.{model_type}.nc"). Defaults to "global".
         \b
         latitude_bounds (list[float], optional): [min, max] latitude box (degrees) to
-            restrict the verification to. Limits the forecast, the observations, and
-            the target grid (which becomes an xesmf.util.grid_2d over the box clipped
-            to the forecast extent). Use this to verify a limited region of an
-            otherwise global forecast. If omitted, the full domain is used.
+            restrict the verification to. Limits the forecast and the observations.
+            Use this to verify a limited region of an otherwise global forecast. If
+            omitted, the full domain is used.
         \b
         longitude_bounds (list[float], optional): [min, max] longitude box (degrees)
             to restrict the verification to. Interpreted in [0, 360) with min < max

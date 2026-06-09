@@ -3,15 +3,24 @@ Compute spatial maps of metrics against observations.
 
 This workflow is the spatial analogue of ``obs_metrics.py``. Rather than
 reducing the spatial dimensions to a single number per (forecast hour, initial
-condition), it keeps a spatial grid and accumulates a running sum over initial
-conditions (analogous to ``spatial.py`` with ``keep_t0=False``).
+condition), it keeps a per-station accumulation and runs a running sum over
+initial conditions (analogous to ``spatial.py`` with ``keep_t0=False``).
 
 Observation locations are heterogeneous in time, so for each initial condition
 the forecast is interpolated to the observation locations (exactly as in
 ``obs_metrics.py``), the per-observation error is computed, and those errors are
-binned onto the nearest cell of a user-defined target grid. Running sums of the
-error, squared error, absolute error, and observation count are kept per cell so
-that RMSE, MAE, and bias maps can be formed at the end.
+aggregated by station. A "station" is just the observation's own location
+rounded to ``round_decimals`` decimal degrees (~100 m at the default of 3), so
+we stay in observation space rather than binning onto a model grid. Running
+sums of the error, squared error, absolute error, and observation count are kept
+per station so that RMSE, MAE, and bias can be formed at the end.
+
+Keying on the (rounded) observation location -- rather than snapping to a
+model-specific target grid -- means two different forecasts verified against the
+same observation network land on an *identical* station axis, so their per-cell
+errors can be differenced directly downstream with no regridding. The output has
+dims (fhr, [level,] station) with ``latitude``/``longitude`` coordinates riding
+along the ``station`` dimension.
 """
 import importlib
 import logging
@@ -20,8 +29,6 @@ import yaml
 import numpy as np
 import xarray as xr
 import pandas as pd
-
-import xesmf
 
 from eagle.tools.obs_metrics import (
     _load_obs_config,
@@ -39,62 +46,8 @@ from eagle.tools.obs_metrics import (
 
 logger = logging.getLogger("eagle.tools")
 
-# Running accumulator quantities kept per grid cell.
+# Running accumulator quantities kept per station.
 COMPONENTS = ("sum_err", "sum_sq_err", "sum_abs_err", "count")
-
-
-def build_target_grid(fds, model_type, d_lat, d_lon=None, lat_bounds=None, lon_bounds=None):
-    """Build the target grid the observation errors are binned onto.
-
-    Args:
-        fds: A loaded forecast xr.Dataset with ``latitude``/``longitude`` coords.
-            Only used (for its spatial extent) when the grid is regional.
-        model_type: User model type string. ``"global"`` in the string selects a
-            global grid; ``"lam"`` selects a regional grid sized to the forecast.
-        d_lat: Latitude grid spacing in degrees.
-        d_lon: Longitude grid spacing in degrees. Defaults to ``d_lat``.
-        lat_bounds: Optional ``(min, max)`` latitude box (degrees) to restrict the
-            grid to. Clipped to the forecast extent.
-        lon_bounds: Optional ``(min, max)`` longitude box (degrees, ``[0, 360)``,
-            ``min < max``) to restrict the grid to. Clipped to the forecast extent.
-
-    Returns:
-        xr.Dataset from xesmf describing the target grid.
-    """
-    if d_lon is None:
-        d_lon = d_lat
-
-    # When the user asks for a region, grid only that box (clipped to the forecast
-    # extent) regardless of model type. This is the path for verifying a limited
-    # area of an otherwise global forecast.
-    if lat_bounds is not None or lon_bounds is not None:
-        flat = fds["latitude"].values
-        flon = fds["longitude"].values % 360
-        lat_lo, lat_hi = lat_bounds if lat_bounds is not None else (
-            float(np.nanmin(flat)), float(np.nanmax(flat)))
-        lon_lo, lon_hi = lon_bounds if lon_bounds is not None else (
-            float(np.nanmin(flon)), float(np.nanmax(flon)))
-        lat_lo = max(lat_lo, float(np.nanmin(flat)))
-        lat_hi = min(lat_hi, float(np.nanmax(flat)))
-        lon_lo = max(lon_lo, float(np.nanmin(flon)))
-        lon_hi = min(lon_hi, float(np.nanmax(flon)))
-        if not (lat_lo < lat_hi and lon_lo < lon_hi):
-            raise ValueError(
-                "Requested region does not overlap the forecast extent "
-                f"(lat {lat_lo}-{lat_hi}, lon {lon_lo}-{lon_hi})"
-            )
-        return xesmf.util.grid_2d(lon_lo, lon_hi, d_lon, lat_lo, lat_hi, d_lat)
-
-    if "global" in model_type:
-        return xesmf.util.grid_global(d_lon, d_lat, cf=True, lon1=360)
-    elif "lam" in model_type:
-        lon = fds["longitude"].values % 360
-        lat = fds["latitude"].values
-        return xesmf.util.grid_2d(
-            float(np.nanmin(lon)), float(np.nanmax(lon)), d_lon,
-            float(np.nanmin(lat)), float(np.nanmax(lat)), d_lat,
-        )
-    raise NotImplementedError(f"model_type '{model_type}' must contain 'global' or 'lam'")
 
 
 def _subset_forecast_to_bounds(fds, lat_bounds, lon_bounds):
@@ -147,23 +100,19 @@ def _filter_obs_to_bounds(obs_df, lat_bounds, lon_bounds):
     return obs_df
 
 
-def _grid_centers(grid):
-    """Return ascending 1-D latitude and longitude cell centers as DataArrays.
+def _station_ids(lat, lon, round_decimals):
+    """Per-observation station ids (rounded "lat_lon") and their rounded coords.
 
-    Handles both the 2-D ``lat``/``lon`` from ``xesmf.util.grid_2d`` (latitude
-    along axis 0, longitude along axis 1) and the 1-D coordinates from
-    ``xesmf.util.grid_global(cf=True)``.
+    Two observations from the same fixed station report nearly identical
+    coordinates, so rounding collapses them onto one station id. Returns the id
+    array plus the rounded latitude/longitude arrays (used to attach coordinates
+    to the station axis).
     """
-    lat = grid["lat"].values
-    lon = grid["lon"].values
-    lat = lat[:, 0] if lat.ndim == 2 else lat
-    lon = lon[0, :] if lon.ndim == 2 else lon
-    if not (np.all(np.diff(lat) > 0) and np.all(np.diff(lon) > 0)):
-        raise ValueError("Target grid centers must be strictly ascending")
-    return (
-        xr.DataArray(lat, dims="latitude", coords={"latitude": lat}),
-        xr.DataArray(lon, dims="longitude", coords={"longitude": lon}),
-    )
+    rlat = np.round(lat, round_decimals)
+    rlon = np.round(lon, round_decimals)
+    sid = np.array([f"{a:.{round_decimals}f}_{o:.{round_decimals}f}"
+                    for a, o in zip(rlat, rlon)])
+    return sid, rlat, rlon
 
 
 def _extract_forecast_values(interpolated, vinfo):
@@ -192,46 +141,24 @@ def _extract_forecast_values(interpolated, vinfo):
     return fvals
 
 
-def _grid_errors(err, snap_lat, snap_lon, lat, lon):
-    """Aggregate per-observation errors onto the target grid.
+def _station_sums(err, sid, fhr):
+    """Per-station summed accumulator components for one (var, fhr).
 
-    Each observation has already been snapped to its nearest grid-cell center
-    (``snap_lat``/``snap_lon``). Observations sharing a cell are summed, and
-    cells with no observations are filled with zero so the result can be added
-    into a running accumulator.
-
-    Args:
-        err: xr.DataArray of forecast-minus-obs over the ``locations`` dim. Non
-            finite entries (e.g. obs outside the forecast domain) are ignored.
-        snap_lat, snap_lon: nearest grid-cell centers per observation.
-        lat, lon: 1-D DataArrays of grid-cell centers to lay the result out on.
-
-    Returns:
-        xr.Dataset with the COMPONENTS as data variables on (latitude, longitude).
+    ``err`` is the per-observation forecast-minus-obs array (non-finite entries,
+    e.g. obs outside the forecast domain or masked by QC, contribute 0 and are
+    not counted). Returns a DataFrame indexed by (station, fhr).
     """
-    # Drop coords carried over from the interpolation (e.g. the scalar forecast
-    # ``time`` and the obs-point ``lat``/``lon``); only the snapped grid centers
-    # assigned below should ride along.
-    err = err.reset_coords(drop=True)
-    valid = err.notnull()
-    ds = xr.Dataset(
-        {
-            "sum_err": err,
-            "sum_sq_err": err**2,
-            "sum_abs_err": np.abs(err),
-            "count": valid.astype(float),
-        },
-        coords={
-            "latitude": ("locations", snap_lat),
-            "longitude": ("locations", snap_lon),
-        },
-    )
-    ds = ds.set_index(locations=["latitude", "longitude"]).groupby("locations").sum()
-    # unstack fills the "cross" cells (a present latitude x a present longitude
-    # with no observation there) -- fill those with 0, not NaN, or they would
-    # poison the running accumulator (NaN + x = NaN) and drop later obs there.
-    ds = ds.unstack("locations", fill_value=0.0)
-    return ds.reindex(latitude=lat, longitude=lon, fill_value=0.0)
+    finite = np.isfinite(err)
+    df = pd.DataFrame({
+        "station": sid,
+        "sum_err": np.where(finite, err, 0.0),
+        "sum_sq_err": np.where(finite, err * err, 0.0),
+        "sum_abs_err": np.where(finite, np.abs(err), 0.0),
+        "count": finite.astype(float),
+    })
+    g = df.groupby("station", sort=False)[list(COMPONENTS)].sum()
+    g["fhr"] = fhr
+    return g.set_index("fhr", append=True)
 
 
 def _metric(ds, name):
@@ -249,7 +176,23 @@ def _metric(ds, name):
     raise ValueError(f"unknown metric '{name}'")
 
 
-def _finalize(total, variable_map):
+def _to_station_dataset(df, station_loc):
+    """Convert a (station, fhr)-indexed sums DataFrame to an xr.Dataset.
+
+    The result has dims (station, fhr) with the accumulator COMPONENTS as data
+    variables and ``latitude``/``longitude`` coordinates on the station axis.
+    (station, fhr) combinations never observed are filled with 0.
+    """
+    ds = df.sort_index().to_xarray()
+    for c in COMPONENTS:
+        ds[c] = ds[c].fillna(0.0)
+    sids = ds["station"].values
+    lat = np.array([station_loc[s][0] for s in sids])
+    lon = np.array([station_loc[s][1] for s in sids])
+    return ds.assign_coords(latitude=("station", lat), longitude=("station", lon))
+
+
+def _finalize(total, station_loc, variable_map):
     """Turn accumulated sums into rmse/mae/bias/count datasets, by variable.
 
     Variables are grouped by base name, stacking levels for upper-air variables,
@@ -257,24 +200,28 @@ def _finalize(total, variable_map):
 
     Returns:
         dict mapping metric name -> xr.Dataset, each variable having dims
-        (fhr, [level,] latitude, longitude).
+        (fhr, [level,] station).
     """
     metrics = ("rmse", "mae", "bias", "count")
 
+    station_ds = {var: _to_station_dataset(df, station_loc)
+                  for var, df in total.items() if df is not None}
+
     base_groups = {}
     for forecast_var, vinfo in variable_map.items():
-        base_groups.setdefault(vinfo["base_name"], {})[vinfo["level"]] = forecast_var
+        if forecast_var in station_ds:
+            base_groups.setdefault(vinfo["base_name"], {})[vinfo["level"]] = forecast_var
 
     containers = {}
     for metric in metrics:
         data_vars = {}
         for base_name, level_dict in base_groups.items():
             if None in level_dict:
-                data_vars[base_name] = _metric(total[level_dict[None]], metric)
+                data_vars[base_name] = _metric(station_ds[level_dict[None]], metric)
             else:
                 levels = sorted(level_dict.keys())
                 arrays = [
-                    _metric(total[level_dict[lvl]], metric).expand_dims({"level": [lvl]})
+                    _metric(station_ds[level_dict[lvl]], metric).expand_dims({"level": [lvl]})
                     for lvl in levels
                 ]
                 data_vars[base_name] = xr.concat(arrays, dim="level")
@@ -286,44 +233,72 @@ def _finalize(total, variable_map):
     return containers
 
 
-def _reduce_accumulators(total, topo, forecast_var_names, fhr_coord, lat, lon):
-    """Sum the per-rank accumulators onto the root rank with MPI.
+def _merge_station_accumulators(total, station_loc, topo, forecast_var_names):
+    """Sum the per-rank station accumulators onto root with MPI.
 
-    Uses a buffer-based ``comm.Reduce`` on each accumulator array (a few hundred
-    MB) rather than pickling and gathering whole accumulator dicts, which for
-    fine grids would blow past mpi4py's ~2 GiB pickle-message limit and pile
-    every rank's data up on root.
-
-    The grid/forecast-hour metadata is broadcast from root so that any rank that
-    processed no initial conditions can still take part in the collective with
-    matching (zero-filled) buffers.
+    The ranks agree on a common (station, fhr) layout, then each variable's
+    components are summed with a buffer-based ``comm.Reduce`` on dense
+    ``(n_station, n_fhr)`` float arrays (a few MB each). We deliberately avoid
+    pickling and gathering the whole per-rank DataFrames: over a long record the
+    station set grows large enough that a single ``comm.gather`` of them exceeds
+    mpi4py's ~2 GiB pickle-message limit (MPI_ERR_ARG). Only the small
+    station-id -> lat/lon maps are gathered.
 
     Returns:
-        On root, the reduced accumulator dict; on other ranks, the (unused)
-        local accumulators.
+        On root, the merged (total, station_loc); on other ranks, the inputs.
     """
     from mpi4py import MPI
 
     comm = topo.comm
+    # ranks that processed no initial conditions never learned these
     forecast_var_names = comm.bcast(forecast_var_names, root=topo.root)
-    fhr_coord = comm.bcast(fhr_coord, root=topo.root)
-    lat = comm.bcast(lat, root=topo.root)
-    lon = comm.bcast(lon, root=topo.root)
+    if total is None:
+        total = {}
 
-    if total is None:  # this rank processed no initial conditions
-        template = xr.Dataset(
-            {c: xr.zeros_like(lat * lon) for c in COMPONENTS}
-        ).expand_dims(fhr=fhr_coord)
-        total = {var: template.copy(deep=True) for var in forecast_var_names}
+    # global station ordering: gather the small id->lat/lon maps onto root, then
+    # broadcast the agreed (sorted) station list so every rank lays out the same.
+    gathered_loc = comm.gather(station_loc, root=topo.root)
+    if topo.is_root:
+        merged_loc = {}
+        for loc in gathered_loc:
+            merged_loc.update(loc)
+        stations = sorted(merged_loc)
+    else:
+        merged_loc = stations = None
+    stations = comm.bcast(stations, root=topo.root)
+    sidx = {s: i for i, s in enumerate(stations)}
 
+    # global (canonical) forecast hours
+    local_fhrs = set()
+    for df in total.values():
+        if df is not None:
+            local_fhrs |= {int(f) for f in df.index.get_level_values("fhr")}
+    fhrs = sorted(set().union(*comm.allgather(local_fhrs)))
+    fidx = {f: i for i, f in enumerate(fhrs)}
+
+    ns, nf = len(stations), len(fhrs)
+    merged = {}
     for var in forecast_var_names:
+        df = total.get(var)
+        if df is not None:
+            si = df.index.get_level_values("station").map(sidx).to_numpy()
+            fi = df.index.get_level_values("fhr").map(lambda f: fidx[int(f)]).to_numpy()
+        comps = {}
         for comp in COMPONENTS:
-            send = np.ascontiguousarray(total[var][comp].values)
+            send = np.zeros((ns, nf), dtype="float64")
+            if df is not None:
+                send[si, fi] = df[comp].to_numpy()
             recv = np.empty_like(send) if topo.is_root else None
             comm.Reduce(send, recv, op=MPI.SUM, root=topo.root)
             if topo.is_root:
-                total[var][comp].data[...] = recv
-    return total
+                comps[comp] = recv.reshape(-1)
+        if topo.is_root:
+            idx = pd.MultiIndex.from_product([stations, fhrs], names=["station", "fhr"])
+            merged[var] = pd.DataFrame(comps, index=idx)
+
+    if topo.is_root:
+        return merged, merged_loc
+    return total, station_loc
 
 
 def main(config):
@@ -342,16 +317,21 @@ def main(config):
     unit_conversion_funcs = _get_unit_conversion_funcs(obs_config["gravity"])
 
     # Config options
-    model_type = config.get("model_type", "global")
+    model_type = config.get("model_type", "global")  # filename tag only
     temporal_window = pd.Timedelta(config.get("temporal_window", "30min"))
     max_qc_value = config.get("max_qc_value", 2)
+    # Optional subset of forecast hours to verify (default: all in the forecast).
+    # Restricting this also shrinks the per-IC observation-loading window.
+    keep_fhrs = config.get("fhrs", None)
+    if keep_fhrs is not None:
+        keep_fhrs = np.asarray([int(f) for f in keep_fhrs])
     user_levels = config.get("levels", None)
-    d_lat = config["d_lat"]
-    d_lon = config.get("d_lon", None)
+    # Decimal degrees to round obs locations to when forming station ids; 3 ~ 100 m.
+    round_decimals = config.get("round_decimals", 3)
 
-    # Optional region of interest: restrict the forecast, observations, and target
-    # grid to this latitude/longitude box. Longitude is in [0, 360) with min < max
-    # (a contiguous box that does not wrap across the 0/360 seam).
+    # Optional region of interest: restrict the forecast and observations to this
+    # latitude/longitude box. Longitude is in [0, 360) with min < max (a contiguous
+    # box that does not wrap across the 0/360 seam).
     lat_bounds = config.get("latitude_bounds", None)
     lon_bounds = config.get("longitude_bounds", None)
     if lat_bounds is not None:
@@ -390,15 +370,15 @@ def main(config):
     logger.info(f"Datasets: {list(dataset_registry.keys())}")
     logger.info(f"Temporal window: +/- {temporal_window}")
     logger.info(f"Max QC value: {max_qc_value}")
+    logger.info(f"Station rounding: {round_decimals} decimal degrees")
     logger.info(f"Initial Conditions:\n{dates}")
 
     # Lazily initialized once the first forecast is loaded
     levels = user_levels
     variable_map = None
     forecast_var_names = None
-    lat = lon = None      # 1-D grid-center DataArrays
-    fhr_coord = None      # canonical forecast hours
-    total = None          # {forecast_var: accumulator xr.Dataset}
+    total = None              # {forecast_var: (station, fhr) sums DataFrame}
+    station_loc = {}          # station id -> (latitude, longitude)
 
     for batch_idx in range(n_batches):
 
@@ -414,6 +394,13 @@ def main(config):
         if lat_bounds is not None or lon_bounds is not None:
             fds = _subset_forecast_to_bounds(fds, lat_bounds, lon_bounds)
         forecast_valid_times = fds["time"].values
+        fhrs = (
+            (forecast_valid_times - np.datetime64(t0)) / np.timedelta64(1, "h")
+        ).astype(int)
+        if keep_fhrs is not None:
+            keep = np.isin(fhrs, keep_fhrs)
+            forecast_valid_times = forecast_valid_times[keep]
+            fhrs = fhrs[keep]
 
         # One-time setup once we know the forecast grid, levels, and variables
         if variable_map is None:
@@ -423,18 +410,7 @@ def main(config):
             variable_map = build_variable_map(config, levels, obs_config=obs_config)
             forecast_var_names = list(variable_map.keys())
             logger.info(f"Variables to verify: {forecast_var_names}")
-
-            lat, lon = _grid_centers(build_target_grid(
-                fds, model_type, d_lat, d_lon, lat_bounds=lat_bounds, lon_bounds=lon_bounds))
-            fhr_coord = (
-                (forecast_valid_times - np.datetime64(t0)) / np.timedelta64(1, "h")
-            ).astype(int)
-            logger.info(f"Target grid: {lat.size} x {lon.size} (lat x lon)")
-
-            template = xr.Dataset(
-                {c: xr.zeros_like(lat * lon) for c in COMPONENTS}
-            ).expand_dims(fhr=fhr_coord)
-            total = {var: template.copy(deep=True) for var in forecast_var_names}
+            total = {var: None for var in forecast_var_names}
 
         # Load observations over the full valid-time range (padded by the window)
         time_start = pd.Timestamp(forecast_valid_times[0], tz="UTC") - temporal_window - pd.Timedelta("24h")
@@ -451,30 +427,34 @@ def main(config):
 
         aligned = align_obs_to_forecast_times(obs_df, forecast_valid_times, temporal_window)
 
-        # Accumulate gridded sums for this initial condition, adding each forecast
-        # hour straight into its slice of the running accumulator. (Building up a
-        # list of per-hour grids and concatenating instead would roughly double
-        # the in-memory footprint for fine grids.)
+        # Aggregate this initial condition's per-station sums, then fold them into
+        # the running total (a union over stations, since the observed set varies
+        # between initial conditions).
+        ic_frames = {var: [] for var in forecast_var_names}
         for fhr_idx, vtime in enumerate(forecast_valid_times):
             vtimestamp = pd.Timestamp(vtime, tz="UTC")
             if vtimestamp not in aligned:
                 continue
             matched_obs = aligned[vtimestamp]
 
-            # Snap each observation to the nearest target-grid cell center
-            obs_lat = xr.DataArray(matched_obs["LAT"].values, dims="locations")
-            obs_lon = xr.DataArray(matched_obs["LON"].values, dims="locations")
-            snap_lat = lat.sel(latitude=obs_lat, method="nearest").values
-            snap_lon = lon.sel(longitude=obs_lon, method="nearest").values
+            sid, rlat, rlon = _station_ids(
+                matched_obs["LAT"].values, matched_obs["LON"].values, round_decimals)
+            for s, a, o in zip(sid, rlat, rlon):
+                station_loc.setdefault(s, (float(a), float(o)))
 
             interpolated = _interp_to_obs_locations(fds.sel(time=vtime), matched_obs)
 
             for varname, vinfo in variable_map.items():
                 fda = _extract_forecast_values(interpolated, vinfo)
                 obs = xr.DataArray(matched_obs[vinfo["obs_col"]].values, dims="locations")
-                gridded = _grid_errors(fda - obs, snap_lat, snap_lon, lat, lon)
-                for comp in COMPONENTS:
-                    total[varname][comp].data[fhr_idx] += gridded[comp].values
+                err = (fda - obs).values
+                ic_frames[varname].append(_station_sums(err, sid, int(fhrs[fhr_idx])))
+
+        for varname in forecast_var_names:
+            if not ic_frames[varname]:
+                continue
+            ic = pd.concat(ic_frames[varname]).groupby(level=["station", "fhr"]).sum()
+            total[varname] = ic if total[varname] is None else total[varname].add(ic, fill_value=0.0)
 
         del fds, obs_df, aligned
         logger.info(f"Done with {st0}")
@@ -485,10 +465,11 @@ def main(config):
     # hold the complete accumulator on the single process)
     if use_mpi:
         logger.info("Reducing accumulators across ranks")
-        total = _reduce_accumulators(total, topo, forecast_var_names, fhr_coord, lat, lon)
+        total, station_loc = _merge_station_accumulators(
+            total, station_loc, topo, forecast_var_names)
 
     if topo.is_root:
-        containers = _finalize(total, variable_map)
+        containers = _finalize(total, station_loc, variable_map)
         output_path = config["output_path"]
         for metric, xds in containers.items():
             fname = f"{output_path}/spatial.{metric}.convobs.{model_type}.nc"
