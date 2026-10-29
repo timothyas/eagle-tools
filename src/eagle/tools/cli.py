@@ -207,7 +207,11 @@ fss.help = """Compute the deterministic Fractions Skill Score (FSS).
         \b
         output_path (str): Directory where the output is saved, as
             f"{output_path}/fss.{model_type}.nc". The result has data_vars
-            fss, mse, mse_ref with dims (t0, fhr, threshold, radius). If
+            fss, mse, mse_ref with dims (t0, fhr, threshold, radius), plus the
+            grid-point exceedance counts fcst_count, obs_count and the
+            frequency bias frequency_bias = fcst_count / obs_count (NaN where
+            obs_count is 0) with dims (t0, fhr, threshold). To aggregate over
+            t0, use fcst_count.sum("t0") / obs_count.sum("t0"). If
             percentiles are configured, a second file
             f"{output_path}/fss.percentile.{model_type}.nc" is written with
             data_vars pfss, pmse, pmse_ref and dims (t0, fhr, percentile, radius).
@@ -259,6 +263,18 @@ fss.help = """Compute the deterministic Fractions Skill Score (FSS).
         end_date (str): The last initial condition date to process.
         \b
         freq (str): Frequency string for the date range (e.g., "6h").
+        \b
+        months (list[int], optional): Only process initial conditions whose month
+            is in this list, e.g. [12, 1, 2] for DJF.
+        \b
+        region (dict, optional): Lat/lon box to evaluate over. Keys:
+            lat_bounds (list, optional): [lo, hi] in degrees N; either may be null.
+            lon_bounds (list, optional): [lo, hi] in degrees E, -180 to 180;
+                either may be null.
+            The box is built from the verification dataset's latitude/longitude.
+            Neighborhood fractions use the full domain (the box boundary is not
+            a domain edge), but MSE/MSE_ref are averaged over points inside the
+            box only. Percentile thresholds use wet points inside the box.
         \b
         use_mpi (bool, optional): If True, distribute initial conditions across MPI ranks.
         \b

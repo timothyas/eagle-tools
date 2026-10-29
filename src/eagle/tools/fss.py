@@ -66,12 +66,17 @@ def _neighborhood_fraction(binary, valid, size):
     return num / den.where(den > eps)
 
 
-def _fss_from_binaries(fbin, obin, valid, radii_gp):
+def _fss_from_binaries(fbin, obin, valid, radii_gp, region=None):
     """Compute FSS from pre-built binary exceedance fields, looping over radii.
 
     Shared core for both the threshold and percentile variants: they differ only
     in how ``fbin``/``obin`` are constructed. Any extra dims carried on the
     binaries (e.g. ``threshold`` or ``percentile``) pass straight through.
+
+    If ``region`` (a boolean ``(y, x)`` field) is given, the neighborhood
+    fractions are still computed from the full-domain fields, so the region
+    boundary is not treated as a domain edge, but the spatial averages are
+    restricted to points inside the region.
 
     Returns:
         xr.Dataset: ``fss``, ``mse``, ``mse_ref`` with dims
@@ -81,6 +86,9 @@ def _fss_from_binaries(fbin, obin, valid, radii_gp):
     for radius_km, size in radii_gp:
         M = _neighborhood_fraction(fbin, valid, size)
         O = _neighborhood_fraction(obin, valid, size)
+        if region is not None:
+            M = M.where(region)
+            O = O.where(region)
 
         mse = ((M - O) ** 2).mean(("y", "x"))
         mse_ref = (M**2 + O**2).mean(("y", "x"))
@@ -93,7 +101,7 @@ def _fss_from_binaries(fbin, obin, valid, radii_gp):
     return xr.concat(per_radius, dim="radius")
 
 
-def fractions_skill_score(fcst, obs, thresholds, radii_gp):
+def fractions_skill_score(fcst, obs, thresholds, radii_gp, region=None):
     """Deterministic Fractions Skill Score (Roberts & Lean, 2008).
 
     Args:
@@ -102,9 +110,14 @@ def fractions_skill_score(fcst, obs, thresholds, radii_gp):
         thresholds (Sequence[float]): exceedance thresholds (same units as the fields).
         radii_gp (Sequence[tuple[float, int]]): ``(radius_km, window_size)`` pairs,
             where ``window_size = 2*n+1`` grid points.
+        region (xr.DataArray, optional): boolean ``(y, x)`` field; if given, the
+            score is averaged over points inside the region only, and the
+            exceedance counts are taken over points inside the region only.
 
     Returns:
-        xr.Dataset: ``fss``, ``mse``, ``mse_ref`` with dims ``(fhr, threshold, radius)``.
+        xr.Dataset: ``fss``, ``mse``, ``mse_ref`` with dims ``(fhr, threshold, radius)``,
+        and ``fcst_count``, ``obs_count``, ``frequency_bias`` with dims
+        ``(fhr, threshold)``.
     """
     txda = xr.DataArray(
         list(thresholds), dims="threshold", coords={"threshold": list(thresholds)}
@@ -113,10 +126,21 @@ def fractions_skill_score(fcst, obs, thresholds, radii_gp):
     fbin = ((fcst >= txda) & (valid > 0)).astype(float)
     obin = ((obs >= txda) & (valid > 0)).astype(float)
 
-    return _fss_from_binaries(fbin, obin, valid, radii_gp)
+    ds = _fss_from_binaries(fbin, obin, valid, radii_gp, region=region)
+
+    # Grid-point exceedance counts for the frequency bias. Stored as counts (not
+    # the per-IC ratio) so FB = sum(fcst_count) / sum(obs_count) aggregates
+    # correctly over t0. The binaries are already zero at invalid points.
+    if region is not None:
+        fbin = fbin.where(region, 0.0)
+        obin = obin.where(region, 0.0)
+    ds["fcst_count"] = fbin.sum(("y", "x"))
+    ds["obs_count"] = obin.sum(("y", "x"))
+    ds["frequency_bias"] = ds["fcst_count"] / ds["obs_count"].where(ds["obs_count"] > 0)
+    return ds
 
 
-def fractions_skill_score_percentile(fcst, obs, percentiles, radii_gp):
+def fractions_skill_score_percentile(fcst, obs, percentiles, radii_gp, region=None):
     """Percentile-threshold Fractions Skill Score (Roberts & Lean, 2008).
 
     Each field is binarized at its own ``P``-th percentile (``quantile(P/100)``),
@@ -135,6 +159,9 @@ def fractions_skill_score_percentile(fcst, obs, percentiles, radii_gp):
             ``(fhr, y, x)``.
         percentiles (Sequence[float]): percentile ranks in ``[0, 100]``.
         radii_gp (Sequence[tuple[float, int]]): ``(radius_km, window_size)`` pairs.
+        region (xr.DataArray, optional): boolean ``(y, x)`` field; if given, the
+            percentile values are taken over wet points inside the region, and
+            the score is averaged over points inside the region only.
 
     Returns:
         xr.Dataset: ``pfss``, ``pmse``, ``pmse_ref`` with dims
@@ -144,16 +171,19 @@ def fractions_skill_score_percentile(fcst, obs, percentiles, radii_gp):
 
     # Per-field exceedance values from the valid, wet (> 0) points only, one per
     # (fhr, P). Excluding the dry mass keeps low/mid percentiles meaningful.
+    sample = valid > 0
+    if region is not None:
+        sample = sample & region
     qs = [p / 100 for p in percentiles]
-    fq = fcst.where((valid > 0) & (fcst > 0)).quantile(qs, dim=("y", "x"))
-    oq = obs.where((valid > 0) & (obs > 0)).quantile(qs, dim=("y", "x"))
+    fq = fcst.where(sample & (fcst > 0)).quantile(qs, dim=("y", "x"))
+    oq = obs.where(sample & (obs > 0)).quantile(qs, dim=("y", "x"))
     fq = fq.rename({"quantile": "percentile"}).assign_coords(percentile=list(percentiles))
     oq = oq.rename({"quantile": "percentile"}).assign_coords(percentile=list(percentiles))
 
     fbin = ((fcst >= fq) & (valid > 0)).astype(float)
     obin = ((obs >= oq) & (valid > 0)).astype(float)
 
-    ds = _fss_from_binaries(fbin, obin, valid, radii_gp)
+    ds = _fss_from_binaries(fbin, obin, valid, radii_gp, region=region)
     return ds.rename({"fss": "pfss", "mse": "pmse", "mse_ref": "pmse_ref"})
 
 
@@ -205,6 +235,26 @@ def _open_mask(path, varname, lcc_info, trim_edge=None):
             stack_order=list(STACK_ORDER),
         )
     return xds[varname] > 0
+
+
+def _open_region(vds, lat_bounds=None, lon_bounds=None):
+    """Build a boolean ``(y, x)`` lat/lon box from the verification grid.
+
+    Uses the 2D ``latitude``/``longitude`` coords of the (already trimmed)
+    verification dataset, so the result is co-registered with the forecast,
+    verification, and mask fields. Either bound in a pair may be ``None`` to
+    leave that side unbounded. Longitudes are compared in [-180, 180).
+    """
+    lat = vds["latitude"]
+    lon = ((vds["longitude"] + 180) % 360) - 180
+    region = xr.ones_like(lat, dtype=bool)
+    for field, bounds in ((lat, lat_bounds), (lon, lon_bounds)):
+        lo, hi = bounds if bounds is not None else (None, None)
+        if lo is not None:
+            region = region & (field >= lo)
+        if hi is not None:
+            region = region & (field <= hi)
+    return region.drop_vars(["latitude", "longitude"], errors="ignore")
 
 
 def _radii_in_gridpoints(radius, grid_spacing_km):
@@ -281,7 +331,27 @@ def main(config):
             f"Loaded verification mask (valid fraction={float(mask.mean()):.3f})"
         )
 
+    # Optional lat/lon box: neighborhoods still use the full domain, but the
+    # scores are averaged over points inside the region only.
+    region = None
+    if config.get("region", None) is not None:
+        rcfg = config["region"]
+        region = _open_region(
+            vds,
+            lat_bounds=rcfg.get("lat_bounds", None),
+            lon_bounds=rcfg.get("lon_bounds", None),
+        ).load()
+        logger.info(
+            f"Loaded region {rcfg} (domain fraction={float(region.mean()):.3f})"
+        )
+
     dates = pd.date_range(config["start_date"], config["end_date"], freq=config["freq"])
+
+    # Optionally keep only initial conditions in the given months, e.g. a season
+    months = config.get("months", None)
+    if months is not None:
+        dates = dates[dates.month.isin(months)]
+        logger.info(f"Kept {len(dates)} initial conditions in months {months}")
     n_dates = len(dates)
     n_batches = int(np.ceil(n_dates / topo.size))
 
@@ -392,12 +462,16 @@ def main(config):
         def _tag(ds):
             return ds.expand_dims(t0=[t0]).assign_coords(lead_time=("fhr", lead_coord))
 
-        result = _tag(fractions_skill_score(fcst, obs, thresholds, radii_gp))
+        result = _tag(
+            fractions_skill_score(fcst, obs, thresholds, radii_gp, region=region)
+        )
         container.append(result)
 
         if percentiles is not None:
             presult = _tag(
-                fractions_skill_score_percentile(fcst, obs, percentiles, radii_gp)
+                fractions_skill_score_percentile(
+                    fcst, obs, percentiles, radii_gp, region=region
+                )
             )
             pcontainer.append(presult)
 
